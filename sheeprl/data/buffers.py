@@ -191,15 +191,16 @@ class ReplayBuffer:
                     last_key = current_key
                     last_batch_shape = current_batch_shape
         data_len = next(iter(data.values())).shape[0]
+        data_to_store = data
+        if data_len > self._buffer_size:
+            data_len = self._buffer_size
+            data_to_store = {k: v[-self._buffer_size :] for k, v in data.items()}
         next_pos = (self._pos + data_len) % self._buffer_size
-        if next_pos <= self._pos or (data_len > self._buffer_size and not self._full):
+        if next_pos <= self._pos:
             idxes = np.array(list(range(self._pos, self._buffer_size)) + list(range(0, next_pos)))
         else:
             idxes = np.array(range(self._pos, next_pos))
-        if data_len > self._buffer_size:
-            data_to_store = {k: v[-self._buffer_size - next_pos :] for k, v in data.items()}
-        else:
-            data_to_store = data
+
         if self._memmap and self.empty:
             for k, v in data_to_store.items():
                 self.buffer[k] = MemmapArray(
