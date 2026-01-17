@@ -19,6 +19,7 @@ from sheeprl.algos.a2c import a2c  # noqa: F401
 from sheeprl.algos.dreamer_v1 import dreamer_v1  # noqa: F401
 from sheeprl.algos.dreamer_v2 import dreamer_v2  # noqa: F401
 from sheeprl.algos.dreamer_v3 import dreamer_v3  # noqa: F401
+from sheeprl.algos.dreamer_ppo import dreamer_ppo  # noqa: F401
 from sheeprl.algos.droq import droq  # noqa: F401
 from sheeprl.algos.p2e_dv1 import p2e_dv1_exploration  # noqa: F401
 from sheeprl.algos.p2e_dv1 import p2e_dv1_finetuning  # noqa: F401
