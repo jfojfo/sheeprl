@@ -31,21 +31,14 @@ from sheeprl.utils.timer import timer
 from sheeprl.utils.utils import save_configs, Ratio
 
 
-def train(
+def train_world_model(
     fabric: Fabric,
     world_model: WorldModel,
-    actor: nn.Module,
-    critic: nn.Module,
     world_optimizer: Optimizer,
-    # actor_optimizer: Optimizer,
-    # critic_optimizer: Optimizer,
-    ac_optimizer: Optimizer,
     data: Dict[str, Tensor],
     aggregator: MetricAggregator | None,
     cfg: Dict[str, Any],
-    is_continuous: bool,
-    actions_dim: Sequence[int],
-    moments: Moments,
+    shared_vars: Dict[str, Any],
 ) -> None:
     # The environment interaction goes like this:
     # Actions:           a0       a1       a2      a4
@@ -68,6 +61,8 @@ def train(
 
     next_embedded_obs = world_model.encoder(batch_next_obs)
     next_posterior_logits, _ = world_model.rssm._representation(next_embedded_obs)
+
+    shared_vars["latent_states"] = latent_states
 
     # Compute the distribution over the reconstructed observations
     img_shape_start = 1
@@ -105,8 +100,41 @@ def train(
     if cfg.algo.world_model.clip_gradients is not None and cfg.algo.world_model.clip_gradients > 0:
         world_model_grads = torch.nn.utils.clip_grad_norm_(world_model.parameters(), cfg.algo.world_model.clip_gradients)
     world_optimizer.step()
+    if aggregator and not aggregator.disabled:
+        aggregator.update("Loss/world_model_loss", reconstruction_loss.detach())
+        aggregator.update("Loss/observation_loss", observation_loss.mean().detach())
+        aggregator.update("Loss/reward_loss", reward_loss.mean().detach())
+        aggregator.update("Loss/continue_loss", continue_loss.mean().detach())
+        aggregator.update("Loss/state_loss", dyn_loss.mean().detach())
+        aggregator.update("State/kl", kl.mean().detach())
+        if world_model_grads:
+            aggregator.update("Grads/world_model", world_model_grads.mean().detach())
+        aggregator.update(
+            "State/post_entropy",
+            Independent(OneHotCategorical(logits=next_posterior_logits.detach()), 1).entropy().mean().detach(),
+        )
+        aggregator.update(
+            "State/prior_entropy",
+            Independent(OneHotCategorical(logits=next_prior_logits.detach()), 1).entropy().mean().detach(),
+        )
 
+
+def train_ac_with_dreamerv3(
+    fabric: Fabric,
+    world_model: WorldModel,
+    actor: nn.Module,
+    critic: nn.Module,
+    ac_optimizer: Optimizer,
+    data: Dict[str, Tensor],
+    aggregator: MetricAggregator | None,
+    cfg: Dict[str, Any],
+    is_continuous: bool,
+    actions_dim: Sequence[int],
+    moments: Moments,
+    shared_vars: Dict[str, Any],
+) -> None:
     # Behaviour Learning
+    latent_states = shared_vars['latent_states']
     device = fabric.device
     batch_size = cfg.algo.per_rank_batch_size
     latent_states_size = latent_states.shape[-1]
@@ -221,14 +249,6 @@ def train(
     ac_optimizer.step()
 
     if aggregator and not aggregator.disabled:
-        aggregator.update("Loss/world_model_loss", reconstruction_loss.detach())
-        aggregator.update("Loss/observation_loss", observation_loss.mean().detach())
-        aggregator.update("Loss/reward_loss", reward_loss.mean().detach())
-        aggregator.update("Loss/continue_loss", continue_loss.mean().detach())
-        aggregator.update("Loss/state_loss", dyn_loss.mean().detach())
-        aggregator.update("State/kl", kl.mean().detach())
-        if world_model_grads:
-            aggregator.update("Grads/world_model", world_model_grads.mean().detach())
         if actor_grads:
             aggregator.update("Grads/actor", actor_grads.mean().detach())
         if critic_grads:
@@ -237,15 +257,27 @@ def train(
             aggregator.update("Grads/ac", ac_grads.mean().detach())
         aggregator.update("Loss/policy_loss", policy_loss.detach())
         aggregator.update("Loss/value_loss", value_loss.detach())
-        aggregator.update(
-            "State/post_entropy",
-            Independent(OneHotCategorical(logits=next_posterior_logits.detach()), 1).entropy().mean().detach(),
-        )
-        aggregator.update(
-            "State/prior_entropy",
-            Independent(OneHotCategorical(logits=next_prior_logits.detach()), 1).entropy().mean().detach(),
-        )
 
+
+def train(
+    fabric: Fabric,
+    world_model: WorldModel,
+    actor: nn.Module,
+    critic: nn.Module,
+    world_optimizer: Optimizer,
+    # actor_optimizer: Optimizer,
+    # critic_optimizer: Optimizer,
+    ac_optimizer: Optimizer,
+    data: Dict[str, Tensor],
+    aggregator: MetricAggregator | None,
+    cfg: Dict[str, Any],
+    is_continuous: bool,
+    actions_dim: Sequence[int],
+    moments: Moments,
+) -> None:
+    shared_vars = {}
+    train_world_model(fabric, world_model, world_optimizer, data, aggregator, cfg, shared_vars)
+    train_ac_with_dreamerv3(fabric, world_model, actor, critic, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments, shared_vars)
     # Reset everything
     world_optimizer.zero_grad()
     ac_optimizer.zero_grad()
