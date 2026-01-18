@@ -12,83 +12,58 @@ from lightning import Fabric
 from torch import nn, Tensor
 from torch.distributions.utils import probs_to_logits
 
+from sheeprl.algos.dreamer_ppo.utils import choose_latent_state
 from sheeprl.algos.dreamer_v2.utils import compute_stochastic_state
 from sheeprl.algos.dreamer_v3.agent import CNNEncoder, CNNDecoder, Actor
 from sheeprl.algos.dreamer_v3.utils import init_weights, uniform_init_weights
 from sheeprl.models.models import MLP
-from sheeprl.utils.model import ArgsType, ModuleType
 
 
 class WorldModel(nn.Module):
     def __init__(
         self,
         encoder: nn.Module,
-        representation_model: RepresentationModel,
+        rssm: RSSM,
         observation_model: nn.Module,
         reward_model: nn.Module,
         continue_model: Optional[nn.Module],
     ) -> None:
         super().__init__()
         self.encoder = encoder
-        self.representation_model = representation_model
+        self.rssm = rssm
         self.observation_model = observation_model
         self.reward_model = reward_model
         self.continue_model = continue_model
 
-class RepresentationModel(nn.Module):
+class RSSM(nn.Module):
     def __init__(
         self,
-        input_dims: int,
-        action_dims: int,
-        stochastic_size: int,
-        discrete_size: int,
-        hidden_sizes: Sequence[int],
+        representation_model: nn.Module,
+        transition_model: nn.Module,
         distribution_cfg: Dict[str, Any],
+        discrete_size: int = 32,
         unimix: float = 0.01,
-        layer_args: Optional[ArgsType] = None,
-        norm_layer: Optional[Union[ModuleType, Sequence[ModuleType]]] = None,
-        norm_args: Optional[ArgsType] = None,
-        activation: Optional[Union[ModuleType, Sequence[ModuleType]]] = nn.ReLU,
-        act_args: Optional[ArgsType] = None,
     ) -> None:
         super().__init__()
+        self.representation_model = representation_model
+        self.transition_model = transition_model
         self.distribution_cfg = distribution_cfg
-        self.stochastic_size = stochastic_size
         self.discrete_size = discrete_size
         self.unimix = unimix
-        self.latent_model = MLP(
-            input_dims=input_dims,
-            output_dim=stochastic_size * discrete_size,
-            hidden_sizes=hidden_sizes,
-            layer_args=layer_args,
-            norm_layer=norm_layer,
-            norm_args=norm_args,
-            activation=activation,
-            act_args=act_args,
-        )
-        self.transition_model = MLP(
-            input_dims=stochastic_size * discrete_size + int(sum(action_dims)),
-            output_dim=stochastic_size * discrete_size,
-            hidden_sizes=hidden_sizes,
-            layer_args=layer_args,
-            norm_layer=norm_layer,
-            norm_args=norm_args,
-            activation=activation,
-            act_args=act_args,
-        )
 
     def dynamic(self, embedded_obs: Tensor, actions: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         logits, stochastic_state = self._representation(embedded_obs)
-        next_logits, next_stochastic_state = self._transition(logits, actions)
+        latent_state = choose_latent_state(logits, stochastic_state)
+        next_logits, next_stochastic_state = self._transition(latent_state, actions)
         return logits, stochastic_state, next_logits, next_stochastic_state
 
     def _representation(self, embedded_obs: Tensor) -> Tuple[Tensor, Tensor]:
-        logits: Tensor = self.latent_model(embedded_obs)
+        logits: Tensor = self.representation_model(embedded_obs)
         logits = self._uniform_mix(logits)
         return logits, compute_stochastic_state(logits, discrete=self.discrete_size)
 
-    def _transition(self, logits: Tensor, actions: Tensor) -> Tuple[Tensor, Tensor]:
-        mixed = torch.concat([logits, actions], -1)
+    def _transition(self, latent_state: Tensor, actions: Tensor) -> Tuple[Tensor, Tensor]:
+        mixed = torch.concat([latent_state, actions], -1)
         next_logits = self.transition_model(mixed)
         next_logits = self._uniform_mix(next_logits)
         return next_logits, compute_stochastic_state(next_logits, discrete=self.discrete_size)
@@ -108,13 +83,14 @@ class RepresentationModel(nn.Module):
         return logits
 
     def imagination(self, latent_state: Tensor, actions: Tensor) -> Tuple[Tensor, Tensor]:
-        pass
+        logits, stochastic_state = self._transition(latent_state, actions)
+        return logits, stochastic_state
 
 class PlayerDV3(nn.Module):
     def __init__(
         self,
         encoder: nn.Module,
-        latent_state_model: RepresentationModel,
+        rssm: RSSM,
         actor: Actor | nn.Module,
         actions_dim: Sequence[int],
         num_envs: int,
@@ -125,7 +101,7 @@ class PlayerDV3(nn.Module):
     ) -> None:
         super().__init__()
         self.encoder = encoder
-        self.latent_state_model = latent_state_model
+        self.rssm = rssm
         self.actor = actor
         self.actions_dim = actions_dim
         self.num_envs = num_envs
@@ -141,11 +117,10 @@ class PlayerDV3(nn.Module):
         mask: Optional[Dict[str, Tensor]] = None,
     ) -> Sequence[Tensor]:
         embedded_obs = self.encoder(obs)
-        _, stochastic_state = self.latent_state_model._representation(embedded_obs)
-        stochastic_state = stochastic_state.view(
-            *self.stochastic_state.shape[:-2], self.stochastic_size * self.discrete_size
-        )
-        actions, _ = self.actor(stochastic_state, greedy, mask)
+        embedded_obs = embedded_obs.squeeze(0) # remove seq dim
+        logits, stochastic_state = self.rssm._representation(embedded_obs)
+        latent_state = choose_latent_state(logits, stochastic_state)
+        actions, _ = self.actor(latent_state, greedy, mask)
         self.actions = torch.cat(actions, -1)
         return actions
 
@@ -177,15 +152,13 @@ def build_agent(
     encoder = cnn_encoder
 
     representation_ln_cls = hydra.utils.get_class(world_model_cfg.representation_model.layer_norm.cls)
-    representation_model = RepresentationModel(
+    representation_model = MLP(
         input_dims=encoder.output_dim,
-        action_dims=actions_dim,
-        stochastic_size=world_model_cfg.stochastic_size,
-        discrete_size=world_model_cfg.discrete_size,
+        output_dim=latent_state_size,
         hidden_sizes=[world_model_cfg.representation_model.hidden_size],
-        distribution_cfg=world_model_cfg.representation_model.distribution_cfg,
         activation=hydra.utils.get_class(world_model_cfg.representation_model.dense_act),
         layer_args={"bias": representation_ln_cls == nn.Identity},
+        flatten_dim=None,
         norm_layer=[representation_ln_cls],
         norm_args=[
             {
@@ -193,6 +166,29 @@ def build_agent(
                 "normalized_shape": world_model_cfg.representation_model.hidden_size,
             }
         ],
+    )
+    transition_ln_cls = hydra.utils.get_class(world_model_cfg.transition_model.layer_norm.cls)
+    transition_model = MLP(
+        input_dims=latent_state_size + int(sum(actions_dim)),
+        output_dim=latent_state_size,
+        hidden_sizes=[world_model_cfg.transition_model.hidden_size],
+        activation=hydra.utils.get_class(world_model_cfg.transition_model.dense_act),
+        layer_args={"bias": transition_ln_cls == nn.Identity},
+        flatten_dim=None,
+        norm_layer=[transition_ln_cls],
+        norm_args=[
+            {
+                **world_model_cfg.transition_model.layer_norm.kw,
+                "normalized_shape": world_model_cfg.transition_model.hidden_size,
+            }
+        ],
+    )
+    rssm = RSSM(
+        representation_model=representation_model.apply(init_weights),
+        transition_model=transition_model.apply(init_weights),
+        distribution_cfg=cfg.distribution,
+        discrete_size=world_model_cfg.discrete_size,
+        unimix=cfg.algo.unimix,
     )
 
     cnn_decoder = CNNDecoder(
@@ -240,7 +236,7 @@ def build_agent(
     )
     world_model = WorldModel(
         encoder.apply(init_weights),
-        representation_model.apply(init_weights),
+        rssm,
         observation_model.apply(init_weights),
         reward_model.apply(init_weights),
         continue_model.apply(init_weights),
@@ -283,16 +279,16 @@ def build_agent(
     if cfg.algo.hafner_initialization:
         actor.mlp_heads.apply(uniform_init_weights(1.0))
         critic.model[-1].apply(uniform_init_weights(0.0))
+        world_model.rssm.representation_model.model[-1].apply(uniform_init_weights(1.0))
+        world_model.rssm.transition_model.model[-1].apply(uniform_init_weights(1.0))
         world_model.reward_model.model[-1].apply(uniform_init_weights(0.0))
         world_model.continue_model.model[-1].apply(uniform_init_weights(1.0))
-        world_model.representation_model.latent_model.model[-1].apply(uniform_init_weights(1.0))
-        world_model.representation_model.transition_model.model[-1].apply(uniform_init_weights(1.0))
         if cnn_decoder is not None:
             cnn_decoder.model[-1].model[-1].apply(uniform_init_weights(1.0))
 
     player = PlayerDV3(
         copy.deepcopy(world_model.encoder),
-        copy.deepcopy(representation_model),
+        copy.deepcopy(rssm),
         copy.deepcopy(actor),
         actions_dim,
         cfg.env.num_envs,
@@ -302,6 +298,8 @@ def build_agent(
     )
     # Tie weights between the agent and the player
     for agent_p, p in zip(world_model.encoder.parameters(), player.encoder.parameters()):
+        p.data = agent_p.data
+    for agent_p, p in zip(world_model.rssm.parameters(), player.rssm.parameters()):
         p.data = agent_p.data
     for agent_p, p in zip(actor.parameters(), player.actor.parameters()):
         p.data = agent_p.data
