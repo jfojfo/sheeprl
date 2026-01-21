@@ -17,18 +17,19 @@ from torch.distributions import kl_divergence, OneHotCategoricalStraightThrough,
 from torch.optim import Optimizer
 from torchmetrics import SumMetric
 
-from sheeprl.algos.dreamer_ppo.agent import build_agent, WorldModel
-from sheeprl.algos.dreamer_ppo.utils import choose_latent_state
+from sheeprl.algos.dreamer_ppo.agent import build_agent, WorldModel, tie_player_weights
+from sheeprl.algos.dreamer_ppo.old import train_with_dreamerv3, build_agent_with_dreamerv3
+from sheeprl.algos.dreamer_ppo.utils import choose_latent_state, compute_gae_with_dreamer
 from sheeprl.algos.dreamer_v3.utils import prepare_obs, Moments, test, compute_lambda_values
-from sheeprl.data.buffers import EnvIndependentReplayBuffer, ReplayBuffer
+from sheeprl.data.buffers import EnvIndependentReplayBuffer, ReplayBuffer, SequentialReplayBuffer
 from sheeprl.envs.wrappers import RestartOnException
-from sheeprl.utils.distribution import MSEDistribution
+from sheeprl.utils.distribution import MSEDistribution, BernoulliSafeMode
 from sheeprl.utils.env import make_env
 from sheeprl.utils.logger import get_logger, get_log_dir
 from sheeprl.utils.metric import MetricAggregator
 from sheeprl.utils.registry import register_algorithm
 from sheeprl.utils.timer import timer
-from sheeprl.utils.utils import save_configs, Ratio
+from sheeprl.utils.utils import save_configs, Ratio, normalize_tensor
 
 
 def train_world_model(
@@ -75,24 +76,33 @@ def train_world_model(
     pr = MSEDistribution(world_model.reward_model(latent_states), dims=1)
 
     # Compute the distribution over the terminal steps, if required
-    pc = MSEDistribution(world_model.continue_model(latent_states), dims=1)
+    pc = Independent(BernoulliSafeMode(logits=world_model.continue_model(latent_states)), 1)
     continues_targets = 1 - data["terminated"]
 
     # KL balancing
     dyn_loss = kl = kl_divergence(
-        Independent(OneHotCategoricalStraightThrough(logits=next_prior_logits), 1),
         Independent(OneHotCategoricalStraightThrough(logits=next_posterior_logits.detach()), 1),
+        Independent(OneHotCategoricalStraightThrough(logits=next_prior_logits), 1),
     )
     kl_free_nats = cfg.algo.world_model.kl_free_nats
     kl_dynamic = cfg.algo.world_model.kl_dynamic
     free_nats = torch.full_like(dyn_loss, kl_free_nats)
     dyn_loss = kl_dynamic * torch.maximum(dyn_loss, free_nats)
 
+    repr_loss = kl_divergence(
+        Independent(OneHotCategoricalStraightThrough(logits=next_posterior_logits), 1),
+        Independent(OneHotCategoricalStraightThrough(logits=next_prior_logits.detach()), 1),
+    )
+    kl_representation = cfg.algo.world_model.kl_representation
+    repr_loss = kl_representation * torch.maximum(repr_loss, free_nats)
+    kl_loss = dyn_loss + repr_loss
+
     items = [po[k].log_prob(batch_next_obs[k]) for k in po.keys()]
     observation_loss = -sum(items)
     reward_loss = -pr.log_prob(data["rewards"])
     continue_loss = cfg.algo.world_model.continue_scale_factor * -pc.log_prob(continues_targets)
-    reconstruction_loss = (observation_loss + reward_loss + continue_loss + dyn_loss).mean()
+    kl_regularizer = cfg.algo.world_model.kl_regularizer
+    reconstruction_loss = (observation_loss + reward_loss + continue_loss + kl_regularizer * kl_loss).mean()
 
     world_optimizer.zero_grad()
     reconstruction_loss.backward()
@@ -105,7 +115,7 @@ def train_world_model(
         aggregator.update("Loss/observation_loss", observation_loss.mean().detach())
         aggregator.update("Loss/reward_loss", reward_loss.mean().detach())
         aggregator.update("Loss/continue_loss", continue_loss.mean().detach())
-        aggregator.update("Loss/state_loss", dyn_loss.mean().detach())
+        aggregator.update("Loss/state_loss", kl_loss.mean().detach())
         aggregator.update("State/kl", kl.mean().detach())
         if world_model_grads:
             aggregator.update("Grads/world_model", world_model_grads.mean().detach())
@@ -124,6 +134,7 @@ def train_ac_with_dreamerv3(
     world_model: WorldModel,
     actor: nn.Module,
     critic: nn.Module,
+    target_critic: torch.nn.Module,
     ac_optimizer: Optimizer,
     data: Dict[str, Tensor],
     aggregator: MetricAggregator | None,
@@ -182,7 +193,9 @@ def train_ac_with_dreamerv3(
     # Predict values, rewards and continues
     predicted_values = critic(imagined_trajectories)
     predicted_rewards = world_model.reward_model(imagined_trajectories)
-    continues = world_model.continue_model(imagined_trajectories)
+    continues = Independent(BernoulliSafeMode(logits=world_model.continue_model(imagined_trajectories)), 1).mode
+    true_continue = (1 - data["terminated"]).flatten().reshape(1, -1, 1)
+    continues = torch.cat((true_continue, continues[1:]))
 
     # Estimate lambda-values
     lambda_values = compute_lambda_values(
@@ -233,8 +246,12 @@ def train_ac_with_dreamerv3(
     policy_loss = -torch.mean(discount[:-1].detach() * (objective + entropy.unsqueeze(dim=-1)[:-1]))
 
     qv = MSEDistribution(predicted_values[:-1], dims=1)
+    predicted_target_values = MSEDistribution(
+        target_critic(imagined_trajectories[:-1]), dims=1
+    ).mean
     value_loss = -qv.log_prob(lambda_values.detach())
-    value_loss = torch.mean(value_loss * discount[:-1].squeeze(-1))
+    value_loss = value_loss - qv.log_prob(predicted_target_values.detach())
+    value_loss = torch.mean(value_loss * discount[:-1].squeeze(-1).detach())
     ac_loss = policy_loss + value_loss
 
     ac_optimizer.zero_grad()
@@ -259,14 +276,127 @@ def train_ac_with_dreamerv3(
         aggregator.update("Loss/value_loss", value_loss.detach())
 
 
+def train_ac_with_ppo(
+    fabric: Fabric,
+    world_model: WorldModel,
+    actor: nn.Module,
+    critic: nn.Module,
+    target_critic: torch.nn.Module,
+    ac_optimizer: Optimizer,
+    data: Dict[str, Tensor],
+    aggregator: MetricAggregator | None,
+    cfg: Dict[str, Any],
+    is_continuous: bool,
+    actions_dim: Sequence[int],
+    moments: Moments,
+    shared_vars: Dict[str, Any],
+) -> None:
+    # Behaviour Learning
+    latent_states = shared_vars['latent_states']
+    device = fabric.device
+    batch_size = cfg.algo.per_rank_batch_size
+    latent_states_size = latent_states.shape[-1]
+    clip_param = cfg.algo.e_clip
+
+    imagined_trajectories = torch.empty(
+        cfg.algo.horizon + 1,
+        batch_size,
+        latent_states_size,
+        device=device,
+    )
+    imagined_actions = torch.empty(
+        cfg.algo.horizon + 1,
+        batch_size,
+        data["actions"].shape[-1],
+        device=device,
+    )
+    imagined_latent_state = latent_states
+    actions = torch.cat(actor(imagined_latent_state.detach())[0], dim=-1)
+    imagined_trajectories[0] = imagined_latent_state
+    imagined_actions[0] = actions
+
+    # The imagination goes like this, with H=3:
+    # Actions:           a'0      a'1      a'2     a'4
+    #                    ^ \      ^ \      ^ \     ^
+    #                   /   \    /   \    /   \   /
+    #                  /     \  /     \  /     \ /
+    # States:        z0 ---> z'1 ---> z'2 ---> z'3
+    # Rewards:       r'0     r'1      r'2      r'3
+    # Values:        v'0     v'1      v'2      v'3
+    # Lambda-values:         l'1      l'2      l'3
+    # Continues:     c0      c'1      c'2      c'3
+    # where z0 comes from the posterior, while z'i is the imagined states (prior)
+
+    # Imagine trajectories in the latent space
+    for i in range(1, cfg.algo.horizon + 1):
+        imagined_logits, imagined_stochastic_state = world_model.rssm.imagination(imagined_latent_state, actions)
+        imagined_latent_state = choose_latent_state(imagined_logits, imagined_stochastic_state)
+        imagined_trajectories[i] = imagined_latent_state
+        actions = torch.cat(actor(imagined_latent_state.detach())[0], dim=-1)
+        imagined_actions[i] = actions
+    imagined_trajectories, imagined_actions = imagined_trajectories.detach(), imagined_actions.detach()
+
+    # Predict values, rewards and continues
+    predicted_values = critic(imagined_trajectories)
+    predicted_rewards = world_model.reward_model(imagined_trajectories)
+    continues = Independent(BernoulliSafeMode(logits=world_model.continue_model(imagined_trajectories)), 1).mode
+
+    return_, _ = compute_gae_with_dreamer(predicted_rewards, predicted_values, continues, cfg.algo.gamma, cfg.algo.lmbda)
+    advantage = normalize_tensor(return_ - predicted_values[:-1])
+    return_, advantage = return_.detach(), advantage.detach()
+    policies: Sequence[Distribution] = actor(imagined_trajectories)[1]
+    log_probs = [
+        p.log_prob(imgnd_act.detach()).unsqueeze(-1)[:-1].detach()
+        for p, imgnd_act in zip(policies, torch.split(imagined_actions, actions_dim, dim=-1))
+    ]
+
+    actor_grads, critic_grads, ac_grads = None, None, None
+    for i in range(10):
+        value = critic(imagined_trajectories)
+        policies: Sequence[Distribution] = actor(imagined_trajectories)[1]
+        actor_loss, entropy_loss = 0, 0
+        for p, imgnd_act, old_log_probs in zip(policies, torch.split(imagined_actions, actions_dim, dim=-1), log_probs):
+            new_log_probs = p.log_prob(imgnd_act.detach()).unsqueeze(-1)[:-1]
+            ratio = (new_log_probs - old_log_probs).exp()  # new_prob/old_prob
+            surr1 = ratio * advantage
+            surr2 = torch.clamp(ratio, 1.0 - clip_param, 1.0 + clip_param) * advantage
+            actor_loss += -torch.min(surr1, surr2)
+            entropy_loss += p.entropy()[:-1]
+        actor_loss, entropy_loss = actor_loss.mean(), entropy_loss.mean()
+        policy_loss = actor_loss - 0.01 * entropy_loss
+
+        qv = MSEDistribution(value[:-1], dims=1)
+        value_loss = -qv.log_prob(return_)
+        value_loss = 0.5 * torch.mean(value_loss)
+        ac_loss = value_loss + policy_loss
+        ac_optimizer.zero_grad()
+        ac_loss.backward()
+        if cfg.algo.actor.clip_gradients is not None and cfg.algo.actor.clip_gradients > 0:
+            actor_grads = torch.nn.utils.clip_grad_norm_(actor.parameters(), float('inf'))
+            critic_grads = torch.nn.utils.clip_grad_norm_(critic.parameters(), float('inf'))
+            ac_grads = torch.nn.utils.clip_grad_norm_(list(actor.parameters()) + list(critic.parameters()), cfg.algo.actor.clip_gradients)
+        ac_optimizer.step()
+
+    if aggregator and not aggregator.disabled:
+        if actor_grads:
+            aggregator.update("Grads/actor", actor_grads.mean().detach())
+        if critic_grads:
+            aggregator.update("Grads/critic", critic_grads.mean().detach())
+        if ac_grads:
+            aggregator.update("Grads/ac", ac_grads.mean().detach())
+        aggregator.update("Loss/policy_loss", policy_loss.detach())
+        aggregator.update("Loss/value_loss", value_loss.detach())
+
+
 def train(
     fabric: Fabric,
     world_model: WorldModel,
     actor: nn.Module,
     critic: nn.Module,
+    target_critic: torch.nn.Module,
     world_optimizer: Optimizer,
-    # actor_optimizer: Optimizer,
-    # critic_optimizer: Optimizer,
+    actor_optimizer: Optimizer,
+    critic_optimizer: Optimizer,
     ac_optimizer: Optimizer,
     data: Dict[str, Tensor],
     aggregator: MetricAggregator | None,
@@ -277,10 +407,16 @@ def train(
 ) -> None:
     shared_vars = {}
     train_world_model(fabric, world_model, world_optimizer, data, aggregator, cfg, shared_vars)
-    train_ac_with_dreamerv3(fabric, world_model, actor, critic, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments, shared_vars)
+    train_ac_with_dreamerv3(fabric, world_model, actor, critic, target_critic, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments, shared_vars)
+    # train_ac_with_ppo(fabric, world_model, actor, critic, target_critic, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments, shared_vars)
     # Reset everything
     world_optimizer.zero_grad()
-    ac_optimizer.zero_grad()
+    if actor_optimizer is not None:
+        actor_optimizer.zero_grad()
+    if critic_optimizer is not None:
+        critic_optimizer.zero_grad()
+    if ac_optimizer is not None:
+        ac_optimizer.zero_grad()
 
 
 @register_algorithm()
@@ -338,22 +474,26 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
             f"Those keys are decoded without being encoded: {list(set(cfg.algo.cnn_keys.decoder))}"
         )
 
-    world_model, actor, critic, player = build_agent(
+    world_model, actor, critic, target_critic, player = build_agent_with_dreamerv3(
         fabric,
         actions_dim,
         is_continuous,
         cfg,
-        observation_space
+        observation_space,
     )
-    world_model = world_model.to(device=device, dtype=torch.float32)
-    actor = actor.to(device=device, dtype=torch.float32)
-    critic = critic.to(device=device, dtype=torch.float32)
-    player = player.to(device=device, dtype=torch.float32)
+    world_model = world_model.to(device=device)
+    actor = actor.to(device=device)
+    critic = critic.to(device=device)
+    if target_critic is not None:
+        target_critic = target_critic.to(device=device)
+    # player = player.to(device=device)
+    # tie_player_weights(player, world_model, actor)
 
     world_optimizer = hydra.utils.instantiate(cfg.algo.world_model.optimizer, params=world_model.parameters(), _convert_="all")
-    # actor_optimizer = hydra.utils.instantiate(cfg.algo.actor.optimizer, params=actor.parameters(), _convert_="all")
-    # critic_optimizer = hydra.utils.instantiate(cfg.algo.critic.optimizer, params=critic.parameters(), _convert_="all")
-    ac_optimizer = hydra.utils.instantiate(cfg.algo.actor.optimizer, params=list(actor.parameters()) + list(critic.parameters()), _convert_="all")
+    actor_optimizer = hydra.utils.instantiate(cfg.algo.actor.optimizer, params=actor.parameters(), _convert_="all")
+    critic_optimizer = hydra.utils.instantiate(cfg.algo.critic.optimizer, params=critic.parameters(), _convert_="all")
+    # ac_optimizer = hydra.utils.instantiate(cfg.algo.actor.optimizer, params=list(actor.parameters()) + list(critic.parameters()), _convert_="all")
+    ac_optimizer = None
 
     moments = Moments(
         cfg.algo.actor.moments.decay,
@@ -367,11 +507,16 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
         world_model.load_state_dict(state["world_model"])
         actor.load_state_dict(state["actor"])
         critic.load_state_dict(state["critic"])
+        if target_critic is not None:
+            target_critic.load_state_dict(state["target_critic"])
         player.load_state_dict(state["player"])
         world_optimizer.load_state_dict(state["world_optimizer"])
-        # actor_optimizer.load_state_dict(state["actor_optimizer"])
-        # critic_optimizer.load_state_dict(state["critic_optimizer"])
-        ac_optimizer.load_state_dict(state["ac_optimizer"])
+        if actor_optimizer is not None:
+            actor_optimizer.load_state_dict(state["actor_optimizer"])
+        if critic_optimizer is not None:
+            critic_optimizer.load_state_dict(state["critic_optimizer"])
+        if ac_optimizer is not None:
+            ac_optimizer.load_state_dict(state["ac_optimizer"])
         moments.load_state_dict(state["moments"])
 
     save_configs(cfg, log_dir)
@@ -388,7 +533,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
         obs_keys=cfg.algo.cnn_keys.encoder,
         memmap=cfg.buffer.memmap,
         memmap_dir=os.path.join(log_dir, "memmap_buffer", f"rank_{fabric.global_rank}"),
-        buffer_cls=ReplayBuffer,
+        buffer_cls=SequentialReplayBuffer,
     )
     if cfg.checkpoint.resume_from and cfg.buffer.checkpoint:
         rb = state["rb"]
@@ -422,6 +567,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
     step_data["truncated"] = np.zeros((1, cfg.env.num_envs, 1))
     step_data["terminated"] = np.zeros((1, cfg.env.num_envs, 1))
     step_data["is_first"] = np.ones_like(step_data["terminated"])
+    player.init_states()
 
     cumulative_per_rank_gradient_steps = 0
     for iter_num in range(start_iter, total_iters + 1):
@@ -531,38 +677,41 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                 step_data["terminated"][:, dones_idxes] = np.zeros_like(step_data["terminated"][:, dones_idxes])
                 step_data["truncated"][:, dones_idxes] = np.zeros_like(step_data["truncated"][:, dones_idxes])
                 step_data["is_first"][:, dones_idxes] = np.ones_like(step_data["is_first"][:, dones_idxes])
+                player.init_states(dones_idxes)
 
         # Train the agent
         if iter_num >= learning_starts:
             ratio_steps = policy_step - prefill_steps * policy_steps_per_iter
             per_rank_gradient_steps = ratio(ratio_steps)
             if per_rank_gradient_steps > 0:
+                local_data = rb.sample_tensors(
+                    cfg.algo.per_rank_batch_size,
+                    sequence_length=cfg.algo.per_rank_sequence_length,
+                    n_samples=per_rank_gradient_steps,
+                    sample_next_obs=False,
+                    dtype=None,
+                    device=fabric.device,
+                    from_numpy=cfg.buffer.from_numpy,
+                )
                 with timer("Time/train_time", SumMetric, sync_on_compute=cfg.metric.sync_on_compute):
-                    local_data = rb.sample_tensors(
-                        cfg.algo.per_rank_batch_size,
-                        n_samples=per_rank_gradient_steps,
-                        sample_next_obs=True,
-                        dtype=None,
-                        device=fabric.device,
-                        from_numpy=cfg.buffer.from_numpy,
-                    )
                     for i in range(per_rank_gradient_steps):
-                        # if (
-                        #     cumulative_per_rank_gradient_steps % cfg.algo.critic.per_rank_target_network_update_freq
-                        #     == 0
-                        # ):
-                        #     tau = 1 if cumulative_per_rank_gradient_steps == 0 else cfg.algo.critic.tau
-                        #     for cp, tcp in zip(critic.module.parameters(), target_critic.parameters()):
-                        #         tcp.data.copy_(tau * cp.data + (1 - tau) * tcp.data)
+                        if (
+                            cumulative_per_rank_gradient_steps % cfg.algo.critic.per_rank_target_network_update_freq
+                            == 0 and target_critic is not None
+                        ):
+                            tau = 1 if cumulative_per_rank_gradient_steps == 0 else cfg.algo.critic.tau
+                            for cp, tcp in zip(critic.parameters(), target_critic.parameters()):
+                                tcp.data.copy_(tau * cp.data + (1 - tau) * tcp.data)
                         batch = {k: v[i].float() for k, v in local_data.items()}
-                        train(
+                        train_with_dreamerv3(
                             fabric,
                             world_model,
                             actor,
                             critic,
+                            target_critic,
                             world_optimizer,
-                            # actor_optimizer,
-                            # critic_optimizer,
+                            actor_optimizer,
+                            critic_optimizer,
                             ac_optimizer,
                             batch,
                             aggregator,
@@ -610,12 +759,11 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                 "world_model": world_model.state_dict(),
                 "actor": actor.state_dict(),
                 "critic": critic.state_dict(),
-                "player": player.state_dict(),
-                # "target_critic": target_critic.state_dict(),
+                "target_critic": target_critic.state_dict() if target_critic is not None else None,
                 "world_optimizer": world_optimizer.state_dict(),
-                # "actor_optimizer": actor_optimizer.state_dict(),
-                # "critic_optimizer": critic_optimizer.state_dict(),
-                "ac_optimizer": ac_optimizer.state_dict(),
+                "actor_optimizer": actor_optimizer.state_dict() if actor_optimizer is not None else None,
+                "critic_optimizer": critic_optimizer.state_dict() if critic_optimizer is not None else None,
+                "ac_optimizer": ac_optimizer.state_dict() if ac_optimizer is not None else None,
                 "moments": moments.state_dict(),
                 "ratio": ratio.state_dict(),
                 "iter_num": iter_num * fabric.world_size,
@@ -644,7 +792,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
             "world_model": world_model,
             "actor": actor,
             "critic": critic,
-            # "target_critic": target_critic,
+            "target_critic": target_critic if target_critic is not None else None,
             "moments": moments,
         }
         register_model(fabric, log_models, cfg, models_to_log)

@@ -13,6 +13,9 @@ algo:
   total_steps: 5000000
   per_rank_batch_size: 64
   per_rank_sequence_length: 1
+  gamma: 0.99
+  lmbda: 0.95
+  e_clip: 0.2
   cnn_keys:
     encoder: [rgb]
     decoder: [rgb]

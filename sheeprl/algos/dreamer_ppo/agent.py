@@ -124,6 +124,9 @@ class PlayerDV3(nn.Module):
         self.actions = torch.cat(actions, -1)
         return actions
 
+    def init_states(self, reset_envs: Optional[Sequence[int]] = None) -> None:
+        pass
+
 
 def build_agent(
     fabric: Fabric,
@@ -131,7 +134,7 @@ def build_agent(
     is_continuous: bool,
     cfg: Dict[str, Any],
     obs_space: gymnasium.spaces.Dict,
-) -> Tuple[WorldModel, nn.Module, nn.Module, PlayerDV3]:
+) -> Tuple[WorldModel, nn.Module, nn.Module, nn.Module, PlayerDV3]:
     world_model_cfg = cfg.algo.world_model
     actor_cfg = cfg.algo.actor
     critic_cfg = cfg.algo.critic
@@ -287,15 +290,23 @@ def build_agent(
             cnn_decoder.model[-1].model[-1].apply(uniform_init_weights(1.0))
 
     player = PlayerDV3(
-        copy.deepcopy(world_model.encoder),
-        copy.deepcopy(rssm),
-        copy.deepcopy(actor),
+        world_model.encoder, # copy.deepcopy(world_model.encoder),
+        rssm, # copy.deepcopy(rssm),
+        actor, # copy.deepcopy(actor),
         actions_dim,
         cfg.env.num_envs,
         cfg.algo.world_model.stochastic_size,
         fabric.device,
         discrete_size=cfg.algo.world_model.discrete_size,
     )
+
+    # Setup target critic with a SingleDeviceStrategy
+    target_critic = copy.deepcopy(critic)
+
+    return world_model, actor, critic, target_critic, player
+
+
+def tie_player_weights(player, world_model, actor) -> None:
     # Tie weights between the agent and the player
     for agent_p, p in zip(world_model.encoder.parameters(), player.encoder.parameters()):
         p.data = agent_p.data
@@ -303,5 +314,3 @@ def build_agent(
         p.data = agent_p.data
     for agent_p, p in zip(actor.parameters(), player.actor.parameters()):
         p.data = agent_p.data
-
-    return world_model, actor, critic, player
