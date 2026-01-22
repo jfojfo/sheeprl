@@ -6,13 +6,15 @@ defaults:
   - override /model_manager: dreamer_ppo
   - _self_
 
+exp_name: ${algo.name}_${env.id}
+
 # Algorithm
 algo:
   name: dreamer_ppo
   replay_ratio: 1
   total_steps: 5000000
-  per_rank_batch_size: 64
-  per_rank_sequence_length: 1
+  per_rank_batch_size: 16
+  per_rank_sequence_length: 64
   gamma: 0.99
   lmbda: 0.95
   e_clip: 0.2
@@ -22,12 +24,12 @@ algo:
 
 # Checkpoint
 checkpoint:
-  every: 50000
+  every: 100000
 
 # Buffer
 buffer:
   size: 1000000
-  checkpoint: True
+  checkpoint: False
 
 # Distribution
 distribution:

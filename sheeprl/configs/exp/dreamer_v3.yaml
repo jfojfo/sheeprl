@@ -6,8 +6,6 @@ defaults:
   - override /model_manager: dreamer_v3
   - _self_
 
-exp_name: ${algo.name}_${env.id}
-
 # Algorithm
 algo:
   replay_ratio: 1
@@ -25,7 +23,7 @@ checkpoint:
 # Buffer
 buffer:
   size: 1000000
-  checkpoint: False
+  checkpoint: True
 
 # Distribution
 distribution:
