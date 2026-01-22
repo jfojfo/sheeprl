@@ -2,7 +2,7 @@
 from typing import Tuple
 
 import torch
-from functorch.dim import Tensor
+from torch import Tensor
 
 AGGREGATOR_KEYS = {
     "Rewards/rew_avg",
