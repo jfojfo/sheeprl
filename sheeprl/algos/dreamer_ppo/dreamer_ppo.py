@@ -481,11 +481,11 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
         cfg,
         observation_space,
     )
-    world_model = world_model.to(device=device)
-    actor = actor.to(device=device)
-    critic = critic.to(device=device)
+    world_model = world_model.to(device=device, dtype=torch.float32)
+    actor = actor.to(device=device, dtype=torch.float32)
+    critic = critic.to(device=device, dtype=torch.float32)
     if target_critic is not None:
-        target_critic = target_critic.to(device=device)
+        target_critic = target_critic.to(device=device, dtype=torch.float32)
     # player = player.to(device=device)
     # tie_player_weights(player, world_model, actor)
 
