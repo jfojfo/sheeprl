@@ -31,7 +31,7 @@ def choose_latent_state(logits: Tensor, stochastic_state: Tensor) -> Tensor:
 # 返回前n-1个数的gae，最后一个无法计算，因为没有下一个状态
 # dim: [seq_len, batch, *]
 @torch.no_grad()
-def compute_gae_with_dreamer(
+def compute_gae_with_dreamerv3(
     rewards: Tensor,
     values: Tensor,
     continues: Tensor,

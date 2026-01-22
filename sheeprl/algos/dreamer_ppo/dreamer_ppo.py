@@ -19,7 +19,7 @@ from torchmetrics import SumMetric
 
 from sheeprl.algos.dreamer_ppo.agent import build_agent, WorldModel, tie_player_weights
 from sheeprl.algos.dreamer_ppo.old import train_with_dreamerv3, build_agent_with_dreamerv3
-from sheeprl.algos.dreamer_ppo.utils import choose_latent_state, compute_gae_with_dreamer
+from sheeprl.algos.dreamer_ppo.utils import choose_latent_state, compute_gae_with_dreamerv3
 from sheeprl.algos.dreamer_v3.utils import prepare_obs, Moments, test, compute_lambda_values
 from sheeprl.data.buffers import EnvIndependentReplayBuffer, ReplayBuffer, SequentialReplayBuffer
 from sheeprl.envs.wrappers import RestartOnException
@@ -341,7 +341,7 @@ def train_ac_with_ppo(
     predicted_rewards = world_model.reward_model(imagined_trajectories)
     continues = Independent(BernoulliSafeMode(logits=world_model.continue_model(imagined_trajectories)), 1).mode
 
-    return_, _ = compute_gae_with_dreamer(predicted_rewards, predicted_values, continues, cfg.algo.gamma, cfg.algo.lmbda)
+    return_, _ = compute_gae_with_dreamerv3(predicted_rewards, predicted_values, continues, cfg.algo.gamma, cfg.algo.lmbda)
     advantage = normalize_tensor(return_ - predicted_values[:-1])
     return_, advantage = return_.detach(), advantage.detach()
     policies: Sequence[Distribution] = actor(imagined_trajectories)[1]
