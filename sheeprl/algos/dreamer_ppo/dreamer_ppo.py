@@ -686,17 +686,17 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
             ratio_steps = policy_step - prefill_steps * policy_steps_per_iter
             per_rank_gradient_steps = ratio(ratio_steps)
             if per_rank_gradient_steps > 0:
-                local_data = rb.sample_tensors(
-                    cfg.algo.per_rank_batch_size,
-                    sequence_length=cfg.algo.per_rank_sequence_length,
-                    n_samples=per_rank_gradient_steps,
-                    sample_next_obs=False,
-                    dtype=None,
-                    device=fabric.device,
-                    from_numpy=cfg.buffer.from_numpy,
-                )
                 with timer("Time/train_time", SumMetric, sync_on_compute=cfg.metric.sync_on_compute):
                     for i in range(per_rank_gradient_steps):
+                        local_data = rb.sample_tensors(
+                            cfg.algo.per_rank_batch_size,
+                            sequence_length=cfg.algo.per_rank_sequence_length,
+                            n_samples=per_rank_gradient_steps,
+                            sample_next_obs=False,
+                            dtype=None,
+                            device=fabric.device,
+                            from_numpy=cfg.buffer.from_numpy,
+                        )
                         if (
                             cumulative_per_rank_gradient_steps % cfg.algo.critic.per_rank_target_network_update_freq
                             == 0 and target_critic is not None
