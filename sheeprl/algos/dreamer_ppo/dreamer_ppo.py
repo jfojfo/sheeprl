@@ -493,9 +493,9 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
     actor_optimizer = None
     critic_optimizer = None
     world_optimizer = hydra.utils.instantiate(cfg.algo.world_model.optimizer, params=world_model.parameters(), _convert_="all")
-    actor_optimizer = hydra.utils.instantiate(cfg.algo.actor.optimizer, params=actor.parameters(), _convert_="all")
-    critic_optimizer = hydra.utils.instantiate(cfg.algo.critic.optimizer, params=critic.parameters(), _convert_="all")
-    # ac_optimizer = hydra.utils.instantiate(cfg.algo.actor.optimizer, params=list(actor.parameters()) + list(critic.parameters()), _convert_="all")
+    # actor_optimizer = hydra.utils.instantiate(cfg.algo.actor.optimizer, params=actor.parameters(), _convert_="all")
+    # critic_optimizer = hydra.utils.instantiate(cfg.algo.critic.optimizer, params=critic.parameters(), _convert_="all")
+    ac_optimizer = hydra.utils.instantiate(cfg.algo.actor.optimizer, params=list(actor.parameters()) + list(critic.parameters()), _convert_="all")
 
     moments = Moments(
         cfg.algo.actor.moments.decay,
