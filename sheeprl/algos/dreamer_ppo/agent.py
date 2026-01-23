@@ -70,9 +70,9 @@ class RSSM(nn.Module):
 
     def _uniform_mix(self, logits: Tensor) -> Tensor:
         dim = logits.dim()
-        if dim == 2:
+        if dim == 3:
             logits = logits.view(*logits.shape[:-1], -1, self.discrete_size)
-        elif dim != 3:
+        elif dim != 4:
             raise RuntimeError(f"The logits expected shape is 3 or 4: received a {dim}D tensor")
         if self.unimix > 0.0:
             probs = logits.softmax(dim=-1)
@@ -117,7 +117,6 @@ class PlayerDV3(nn.Module):
         mask: Optional[Dict[str, Tensor]] = None,
     ) -> Sequence[Tensor]:
         embedded_obs = self.encoder(obs)
-        embedded_obs = embedded_obs.squeeze(0) # remove seq dim
         logits, stochastic_state = self.rssm._representation(embedded_obs)
         latent_state = choose_latent_state(logits, stochastic_state)
         actions, _ = self.actor(latent_state, greedy, mask)
@@ -211,7 +210,7 @@ def build_agent(
     reward_ln_cls = hydra.utils.get_class(world_model_cfg.reward_model.layer_norm.cls)
     reward_model = MLP(
         input_dims=latent_state_size,
-        output_dim=1, # world_model_cfg.reward_model.bins,
+        output_dim=world_model_cfg.reward_model.bins,
         hidden_sizes=[world_model_cfg.reward_model.dense_units] * world_model_cfg.reward_model.mlp_layers,
         activation=hydra.utils.get_class(world_model_cfg.reward_model.dense_act),
         layer_args={"bias": reward_ln_cls == nn.Identity},
@@ -265,7 +264,7 @@ def build_agent(
     critic_ln_cls = hydra.utils.get_class(critic_cfg.layer_norm.cls)
     critic = MLP(
         input_dims=latent_state_size,
-        output_dim=1, # critic_cfg.bins,
+        output_dim=critic_cfg.bins,
         hidden_sizes=[critic_cfg.dense_units] * critic_cfg.mlp_layers,
         activation=hydra.utils.get_class(critic_cfg.dense_act),
         layer_args={"bias": critic_ln_cls == nn.Identity},
