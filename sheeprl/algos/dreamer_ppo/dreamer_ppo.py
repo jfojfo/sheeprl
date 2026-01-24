@@ -265,9 +265,14 @@ def train_ac(
     policy_loss = policy_loss.mean()
 
     qv = dist_critic_cls(imagined_critic_values[:-1], dims=1)
-    predicted_target_values = dist_critic_cls(target_critic(imagined_trajectories[:-1]), dims=1).mean
-    value_loss = -qv.log_prob(lambda_values.detach()) -qv.log_prob(predicted_target_values.detach())
+    value_loss = -qv.log_prob(lambda_values.detach())
+    if target_critic is not None:
+        predicted_target_values = dist_critic_cls(
+            target_critic(imagined_trajectories[:-1]), dims=1
+        ).mean
+        value_loss = value_loss - qv.log_prob(predicted_target_values.detach())
     value_loss = torch.mean(value_loss * discount[:-1].squeeze(-1).detach())
+
     ac_loss = policy_loss + value_loss
 
     ac_optimizer.zero_grad()
@@ -421,6 +426,8 @@ def train(
     actions_dim: Sequence[int],
     moments: Moments,
 ) -> None:
+    assert (actor_optimizer is not None and critic_optimizer is not None and ac_optimizer is None
+            or actor_optimizer is None and critic_optimizer is None and ac_optimizer is not None)
     shared_vars = {}
     # train_with_dreamerv3(fabric, world_model, actor, critic, target_critic, world_optimizer, actor_optimizer, critic_optimizer, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments)
     train_world_model(fabric, world_model, world_optimizer, data, aggregator, cfg, shared_vars)
