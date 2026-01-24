@@ -646,7 +646,8 @@ def train_with_dreamerv3(
     )
 
     # Compute the distribution over the rewards
-    pr = TwoHotEncodingDistribution(world_model.reward_model(latent_states), dims=1)
+    dist_cls = MSEDistribution if cfg.algo.world_model.reward_model.bins == 1 else TwoHotEncodingDistribution
+    pr = dist_cls(world_model.reward_model(latent_states), dims=1)
 
     # Compute the distribution over the terminal steps, if required
     pc = Independent(BernoulliSafeMode(logits=world_model.continue_model(latent_states)), 1)
@@ -721,8 +722,10 @@ def train_with_dreamerv3(
         imagined_actions[i] = actions
 
     # Predict values, rewards and continues
-    predicted_values = TwoHotEncodingDistribution(critic(imagined_trajectories), dims=1).mean
-    predicted_rewards = TwoHotEncodingDistribution(world_model.reward_model(imagined_trajectories), dims=1).mean
+    dist_critic_cls = MSEDistribution if cfg.algo.critic.bins == 1 else TwoHotEncodingDistribution
+    predicted_values = dist_critic_cls(critic(imagined_trajectories), dims=1).mean
+    dist_rewards_cls = MSEDistribution if cfg.algo.world_model.reward_model.bins == 1 else TwoHotEncodingDistribution
+    predicted_rewards = dist_rewards_cls(world_model.reward_model(imagined_trajectories), dims=1).mean
     continues = Independent(BernoulliSafeMode(logits=world_model.continue_model(imagined_trajectories)), 1).mode
     true_continue = (1 - data["terminated"]).flatten().reshape(1, -1, 1)
     continues = torch.cat((true_continue, continues[1:]))
@@ -784,8 +787,8 @@ def train_with_dreamerv3(
         actor_optimizer.step()
 
     # Predict the values
-    qv = TwoHotEncodingDistribution(critic(imagined_trajectories.detach()[:-1]), dims=1)
-    predicted_target_values = TwoHotEncodingDistribution(
+    qv = dist_critic_cls(critic(imagined_trajectories.detach()[:-1]), dims=1)
+    predicted_target_values = dist_critic_cls(
         target_critic(imagined_trajectories.detach()[:-1]), dims=1
     ).mean
 
