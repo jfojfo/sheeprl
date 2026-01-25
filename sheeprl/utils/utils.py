@@ -231,10 +231,12 @@ def print_config(
             branch_content = OmegaConf.to_yaml(config_section, resolve=resolve)
         branch.add(rich.syntax.Syntax(branch_content, "yaml"))
 
-    rich.print(tree)
+    console = rich.console.Console(force_terminal=False)
+    console.print(tree)
     if cfg_save_path is not None:
         with open(os.path.join(os.getcwd(), "config_tree.txt"), "w") as fp:
-            rich.print(tree, file=fp)
+            console = rich.console.Console(file=fp, force_terminal=False)
+            console.print(tree)
 
 
 def unwrap_fabric(model: _FabricModule | nn.Module) -> nn.Module:
