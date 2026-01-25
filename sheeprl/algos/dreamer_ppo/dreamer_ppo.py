@@ -18,7 +18,8 @@ from torch.optim import Optimizer
 from torchmetrics import SumMetric
 
 from sheeprl.algos.dreamer_ppo.agent import build_agent, WorldModel
-from sheeprl.algos.dreamer_ppo.old import train_with_dreamerv3, build_agent_with_dreamerv3
+from sheeprl.algos.dreamer_ppo.old import train_with_dreamerv3, build_agent_with_dreamerv3, \
+    train_world_model_with_dreamerv3, train_ac_with_dreamerv3
 from sheeprl.algos.dreamer_ppo.utils import choose_latent_state, compute_gae_with_dreamerv3
 from sheeprl.algos.dreamer_v3.utils import prepare_obs, Moments, test, compute_lambda_values
 from sheeprl.data.buffers import EnvIndependentReplayBuffer, ReplayBuffer, SequentialReplayBuffer
@@ -430,8 +431,11 @@ def train(
             or actor_optimizer is None and critic_optimizer is None and ac_optimizer is not None)
     shared_vars = {}
     # train_with_dreamerv3(fabric, world_model, actor, critic, target_critic, world_optimizer, actor_optimizer, critic_optimizer, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments)
-    train_world_model(fabric, world_model, world_optimizer, data, aggregator, cfg, shared_vars)
-    train_ac(fabric, world_model, actor, critic, target_critic, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments, shared_vars)
+    train_world_model_with_dreamerv3(fabric, world_model, world_optimizer, data, aggregator, cfg, shared_vars)
+    train_ac_with_dreamerv3(fabric, world_model, actor, critic, target_critic, actor_optimizer, critic_optimizer, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments, shared_vars)
+
+    # train_world_model(fabric, world_model, world_optimizer, data, aggregator, cfg, shared_vars)
+    # train_ac(fabric, world_model, actor, critic, target_critic, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments, shared_vars)
     # train_ac_with_ppo(fabric, world_model, actor, critic, target_critic, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments, shared_vars)
 
     # Reset everything
@@ -499,7 +503,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
             f"Those keys are decoded without being encoded: {list(set(cfg.algo.cnn_keys.decoder))}"
         )
 
-    world_model, actor, critic, target_critic, player = build_agent(
+    world_model, actor, critic, target_critic, player = build_agent_with_dreamerv3(
         fabric,
         actions_dim,
         is_continuous,
