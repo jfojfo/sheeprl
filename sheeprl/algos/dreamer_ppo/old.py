@@ -14,7 +14,7 @@ from torch.distributions import Independent, Distribution, OneHotCategorical, kl
 from torch.optim import Optimizer
 
 import sheeprl
-from sheeprl.algos.dreamer_v3.agent import CNNEncoder, RecurrentModel, CNNDecoder, Actor
+from sheeprl.algos.dreamer_v3.agent import CNNEncoder, CNNDecoder, Actor
 from sheeprl.algos.dreamer_v3.loss import reconstruction_loss
 from sheeprl.algos.dreamer_v3.utils import Moments, compute_lambda_values, init_weights, uniform_init_weights
 from sheeprl.models.models import MLP
@@ -51,7 +51,8 @@ def build_agent_with_dreamerv3(
     )
     encoder = cnn_encoder
 
-    recurrent_model = RecurrentModel(
+    # recurrent_model = sheeprl.algos.dreamer_v3.agent.RecurrentModel(
+    recurrent_model = sheeprl.algos.dreamer_ppo.agent.RecurrentModel(
         input_size=int(sum(actions_dim) + stochastic_size),
         recurrent_state_size=world_model_cfg.recurrent_model.recurrent_state_size,
         dense_units=world_model_cfg.recurrent_model.dense_units,

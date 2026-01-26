@@ -430,9 +430,10 @@ def train(
     assert (actor_optimizer is not None and critic_optimizer is not None and ac_optimizer is None
             or actor_optimizer is None and critic_optimizer is None and ac_optimizer is not None)
     shared_vars = {}
-    # train_with_dreamerv3(fabric, world_model, actor, critic, target_critic, world_optimizer, actor_optimizer, critic_optimizer, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments)
-    train_world_model_with_dreamerv3(fabric, world_model, world_optimizer, data, aggregator, cfg, shared_vars)
-    train_ac_with_dreamerv3(fabric, world_model, actor, critic, target_critic, actor_optimizer, critic_optimizer, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments, shared_vars)
+    train_with_dreamerv3(fabric, world_model, actor, critic, target_critic, world_optimizer, actor_optimizer, critic_optimizer, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments)
+    # train_world_model_with_dreamerv3(fabric, world_model, world_optimizer, data, aggregator, cfg, shared_vars)
+    # train_ac_with_dreamerv3(fabric, world_model, actor, critic, target_critic, actor_optimizer, critic_optimizer, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments, shared_vars)
+    shared_vars.clear()
 
     # train_world_model(fabric, world_model, world_optimizer, data, aggregator, cfg, shared_vars)
     # train_ac(fabric, world_model, actor, critic, target_critic, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments, shared_vars)

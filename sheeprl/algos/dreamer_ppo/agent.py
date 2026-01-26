@@ -16,7 +16,7 @@ from sheeprl.algos.dreamer_ppo.utils import choose_latent_state
 from sheeprl.algos.dreamer_v2.utils import compute_stochastic_state
 from sheeprl.algos.dreamer_v3.agent import CNNEncoder, CNNDecoder, Actor
 from sheeprl.algos.dreamer_v3.utils import init_weights, uniform_init_weights
-from sheeprl.models.models import MLP
+from sheeprl.models.models import MLP, LayerNorm
 
 
 class WorldModel(nn.Module):
@@ -34,6 +34,41 @@ class WorldModel(nn.Module):
         self.observation_model = observation_model
         self.reward_model = reward_model
         self.continue_model = continue_model
+
+class RecurrentModel(nn.Module):
+    def __init__(
+        self,
+        input_size: int,
+        recurrent_state_size: int,
+        dense_units: int,
+        activation_fn: nn.Module = nn.SiLU,
+        layer_norm_cls: Callable[..., nn.Module] = LayerNorm,
+        layer_norm_kw: Dict[str, Any] = {"eps": 1e-3},
+    ) -> None:
+        super().__init__()
+        self.mlp = MLP(
+            input_dims=input_size,
+            output_dim=recurrent_state_size,
+            hidden_sizes=[dense_units],
+            activation=activation_fn,
+            layer_args={"bias": layer_norm_cls == nn.Identity},
+            norm_layer=[layer_norm_cls],
+            norm_args=[{**layer_norm_kw, "normalized_shape": dense_units}],
+        )
+        # self.rnn = LayerNormGRUCell(
+        #     dense_units,
+        #     recurrent_state_size,
+        #     bias=False,
+        #     batch_first=False,
+        #     layer_norm_cls=layer_norm_cls,
+        #     layer_norm_kw=layer_norm_kw,
+        # )
+        self.recurrent_state_size = recurrent_state_size
+
+    def forward(self, input: Tensor, recurrent_state: Tensor) -> Tensor:
+        feat = self.mlp(input)
+        # out = self.rnn(feat, recurrent_state)
+        return feat
 
 class RSSM(nn.Module):
     def __init__(
