@@ -721,7 +721,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                             cfg.algo.per_rank_batch_size,
                             sequence_length=cfg.algo.per_rank_sequence_length,
                             n_samples=per_rank_gradient_steps,
-                            sample_next_obs=True,
+                            sample_next_obs=False,
                             dtype=None,
                             device=fabric.device,
                             from_numpy=cfg.buffer.from_numpy,
