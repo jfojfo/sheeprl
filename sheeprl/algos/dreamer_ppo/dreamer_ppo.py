@@ -541,7 +541,6 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
         critic.load_state_dict(state["critic"])
         if target_critic is not None:
             target_critic.load_state_dict(state["target_critic"])
-        player.load_state_dict(state["player"])
         world_optimizer.load_state_dict(state["world_optimizer"])
         if actor_optimizer is not None:
             actor_optimizer.load_state_dict(state["actor_optimizer"])
