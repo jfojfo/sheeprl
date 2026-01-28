@@ -150,6 +150,8 @@ def train_ac(
     actor: nn.Module,
     critic: nn.Module,
     target_critic: torch.nn.Module,
+    actor_optimizer: Optimizer,
+    critic_optimizer: Optimizer,
     ac_optimizer: Optimizer,
     data: Dict[str, Tensor],
     aggregator: MetricAggregator | None,
@@ -304,6 +306,8 @@ def train_ac_with_ppo(
     actor: nn.Module,
     critic: nn.Module,
     target_critic: torch.nn.Module,
+    actor_optimizer: Optimizer,
+    critic_optimizer: Optimizer,
     ac_optimizer: Optimizer,
     data: Dict[str, Tensor],
     aggregator: MetricAggregator | None,
@@ -433,11 +437,11 @@ def train(
     train_with_dreamerv3(fabric, world_model, actor, critic, target_critic, world_optimizer, actor_optimizer, critic_optimizer, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments)
     # train_world_model_with_dreamerv3(fabric, world_model, world_optimizer, data, aggregator, cfg, shared_vars)
     # train_ac_with_dreamerv3(fabric, world_model, actor, critic, target_critic, actor_optimizer, critic_optimizer, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments, shared_vars)
-    shared_vars.clear()
 
     # train_world_model(fabric, world_model, world_optimizer, data, aggregator, cfg, shared_vars)
-    # train_ac(fabric, world_model, actor, critic, target_critic, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments, shared_vars)
+    # train_ac(fabric, world_model, actor, critic, target_critic, actor_optimizer, critic_optimizer, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments, shared_vars)
     # train_ac_with_ppo(fabric, world_model, actor, critic, target_critic, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments, shared_vars)
+    shared_vars.clear()
 
     # Reset everything
     world_optimizer.zero_grad()
@@ -448,6 +452,10 @@ def train(
     if ac_optimizer is not None:
         ac_optimizer.zero_grad()
 
+
+F_BUILD_AGENT = build_agent_with_dreamerv3
+F_TRAIN = train
+SAMPLE_NEXT_OBS = True
 
 @register_algorithm()
 def main(fabric: Fabric, cfg: Dict[str, Any]):
@@ -504,7 +512,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
             f"Those keys are decoded without being encoded: {list(set(cfg.algo.cnn_keys.decoder))}"
         )
 
-    world_model, actor, critic, target_critic, player = build_agent_with_dreamerv3(
+    world_model, actor, critic, target_critic, player = F_BUILD_AGENT(
         fabric,
         actions_dim,
         is_continuous,
@@ -721,7 +729,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                             cfg.algo.per_rank_batch_size,
                             sequence_length=cfg.algo.per_rank_sequence_length,
                             n_samples=per_rank_gradient_steps,
-                            sample_next_obs=False,
+                            sample_next_obs=SAMPLE_NEXT_OBS,
                             dtype=None,
                             device=fabric.device,
                             from_numpy=cfg.buffer.from_numpy,
@@ -734,7 +742,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                             for cp, tcp in zip(critic.parameters(), target_critic.parameters()):
                                 tcp.data.copy_(tau * cp.data + (1 - tau) * tcp.data)
                         batch = {k: v[i].float() for k, v in local_data.items()}
-                        train(
+                        F_TRAIN(
                             fabric,
                             world_model,
                             actor,
