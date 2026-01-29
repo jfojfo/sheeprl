@@ -22,6 +22,7 @@ rm -rf Miniconda3-latest-Linux-x86_64.sh
 !cd /kaggle/sheeprl && /kaggle/miniconda/envs/py310/bin/pip install . && /kaggle/miniconda/envs/py310/bin/pip install .[atari]
 !mkdir /kaggle/working/logs
 !ln -sv /kaggle/working/logs/ /kaggle/sheeprl/logs
+!cd /kaggle/sheeprl && git log -n 1
 ```
 
 ```
