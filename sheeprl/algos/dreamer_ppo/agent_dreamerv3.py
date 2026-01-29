@@ -14,7 +14,7 @@ from torch.distributions import Independent, Distribution, OneHotCategorical, kl
 from torch.optim import Optimizer
 
 import sheeprl
-from sheeprl.algos.dreamer_v3.agent import CNNEncoder, CNNDecoder, Actor, RecurrentModel
+from sheeprl.algos.dreamer_v3.agent import CNNEncoder, CNNDecoder, Actor, RecurrentModel, RSSM, WorldModel, PlayerDV3
 from sheeprl.algos.dreamer_v3.loss import reconstruction_loss
 from sheeprl.algos.dreamer_v3.utils import Moments, compute_lambda_values, init_weights, uniform_init_weights
 from sheeprl.models.models import MLP
@@ -23,13 +23,13 @@ from sheeprl.utils.distribution import MSEDistribution, SymlogDistribution, TwoH
 from sheeprl.utils.metric import MetricAggregator
 
 
-def build_agent_with_dreamerv3(
+def build_agent(
     fabric: Fabric,
     actions_dim: Sequence[int],
     is_continuous: bool,
     cfg: Dict[str, Any],
     obs_space: gymnasium.spaces.Dict,
-) -> Tuple[sheeprl.algos.dreamer_v3.agent.WorldModel, nn.Module, nn.Module, nn.Module, sheeprl.algos.dreamer_v3.agent.PlayerDV3]:
+) -> Tuple[WorldModel, nn.Module, nn.Module, nn.Module, PlayerDV3]:
     world_model_cfg = cfg.algo.world_model
     actor_cfg = cfg.algo.actor
     critic_cfg = cfg.algo.critic
@@ -90,7 +90,7 @@ def build_agent_with_dreamerv3(
             }
         ],
     )
-    rssm = sheeprl.algos.dreamer_v3.agent.RSSM(
+    rssm = RSSM(
         recurrent_model=recurrent_model.apply(init_weights),
         representation_model=representation_model.apply(init_weights),
         transition_model=transition_model.apply(init_weights),
@@ -144,7 +144,7 @@ def build_agent_with_dreamerv3(
             "normalized_shape": world_model_cfg.discount_model.dense_units,
         },
     )
-    world_model = sheeprl.algos.dreamer_v3.agent.WorldModel(
+    world_model = WorldModel(
         encoder.apply(init_weights),
         rssm,
         observation_model.apply(init_weights),
@@ -196,7 +196,7 @@ def build_agent_with_dreamerv3(
         if cnn_decoder is not None:
             cnn_decoder.model[-1].model[-1].apply(uniform_init_weights(1.0))
 
-    player = sheeprl.algos.dreamer_v3.agent.PlayerDV3(
+    player = PlayerDV3(
         world_model.encoder, # copy.deepcopy(world_model.encoder),
         rssm, # copy.deepcopy(rssm),
         actor, # copy.deepcopy(actor),
@@ -214,9 +214,9 @@ def build_agent_with_dreamerv3(
     return world_model, actor, critic, target_critic, player
 
 
-def train_world_model_with_dreamerv3(
+def train_world_model(
     fabric: Fabric,
-    world_model: sheeprl.algos.dreamer_v3.agent.WorldModel,
+    world_model: WorldModel,
     world_optimizer: Optimizer,
     data: Dict[str, Tensor],
     aggregator: MetricAggregator | None,
@@ -375,9 +375,9 @@ def train_world_model_with_dreamerv3(
     shared_vars["recurrent_states"] = recurrent_states
 
 
-def train_ac_with_dreamerv3(
+def train_ac(
     fabric: Fabric,
-    world_model: sheeprl.algos.dreamer_v3.agent.WorldModel,
+    world_model: WorldModel,
     actor: nn.Module,
     critic: nn.Module,
     target_critic: torch.nn.Module,
@@ -552,9 +552,9 @@ def train_ac_with_dreamerv3(
             aggregator.update("Grads/ac", ac_grads.mean().detach())
 
 
-def train_with_dreamerv3(
+def train_whole(
     fabric: Fabric,
-    world_model: sheeprl.algos.dreamer_v3.agent.WorldModel,
+    world_model: WorldModel,
     actor: nn.Module,
     critic: nn.Module,
     target_critic: nn.Module,
@@ -857,3 +857,40 @@ def train_with_dreamerv3(
     if ac_optimizer is not None:
         ac_optimizer.zero_grad(set_to_none=True)
     world_optimizer.zero_grad(set_to_none=True)
+
+
+def train_separate(
+    fabric: Fabric,
+    world_model: WorldModel,
+    actor: nn.Module,
+    critic: nn.Module,
+    target_critic: torch.nn.Module,
+    world_optimizer: Optimizer,
+    actor_optimizer: Optimizer,
+    critic_optimizer: Optimizer,
+    ac_optimizer: Optimizer,
+    data: Dict[str, Tensor],
+    aggregator: MetricAggregator | None,
+    cfg: Dict[str, Any],
+    is_continuous: bool,
+    actions_dim: Sequence[int],
+    moments: Moments,
+) -> None:
+    assert (actor_optimizer is not None and critic_optimizer is not None and ac_optimizer is None
+            or actor_optimizer is None and critic_optimizer is None and ac_optimizer is not None)
+    shared_vars = {}
+    train_world_model(fabric, world_model, world_optimizer, data, aggregator, cfg, shared_vars)
+    train_ac(fabric, world_model, actor, critic, target_critic, actor_optimizer, critic_optimizer, ac_optimizer, data, aggregator, cfg, is_continuous, actions_dim, moments, shared_vars)
+    shared_vars.clear()
+
+    # Reset everything
+    world_optimizer.zero_grad()
+    if actor_optimizer is not None:
+        actor_optimizer.zero_grad()
+    if critic_optimizer is not None:
+        critic_optimizer.zero_grad()
+    if ac_optimizer is not None:
+        ac_optimizer.zero_grad()
+
+
+train = train_whole
