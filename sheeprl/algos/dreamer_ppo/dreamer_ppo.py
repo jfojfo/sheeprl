@@ -15,6 +15,7 @@ from torchmetrics import SumMetric
 
 import sheeprl.algos.dreamer_ppo.agent_dreamerv3
 import sheeprl.algos.dreamer_ppo.agent
+import sheeprl.algos.dreamer_ppo.agent_transformer
 from sheeprl.algos.dreamer_v3.utils import prepare_obs, Moments, test
 from sheeprl.data.buffers import EnvIndependentReplayBuffer, SequentialReplayBuffer
 from sheeprl.envs.wrappers import RestartOnException
@@ -26,9 +27,9 @@ from sheeprl.utils.timer import timer
 from sheeprl.utils.utils import save_configs, Ratio
 
 
-F_BUILD_AGENT = sheeprl.algos.dreamer_ppo.agent.build_agent
-F_TRAIN = sheeprl.algos.dreamer_ppo.agent.train
-SAMPLE_NEXT_OBS = True
+F_BUILD_AGENT = sheeprl.algos.dreamer_ppo.agent_transformer.build_agent
+F_TRAIN = sheeprl.algos.dreamer_ppo.agent_transformer.train
+SAMPLE_NEXT_OBS = False
 
 @register_algorithm()
 def main(fabric: Fabric, cfg: Dict[str, Any]):
@@ -209,7 +210,8 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                     mask = {k: v for k, v in torch_obs.items() if k.startswith("mask")}
                     if len(mask) == 0:
                         mask = None
-                    real_actions = actions = player.get_actions(torch_obs, mask=mask)
+                    torch_is_first = torch.from_numpy(step_data["is_first"].copy()).to(fabric.device).float()
+                    real_actions = actions = player.get_actions(torch_obs, is_first=torch_is_first, mask=mask)
                     actions = torch.cat(actions, -1).cpu().numpy()
                     if is_continuous:
                         real_actions = torch.stack(real_actions, dim=-1).cpu().numpy()
@@ -250,7 +252,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                         if aggregator and not aggregator.disabled:
                             aggregator.update("Rewards/rew_avg", ep_rew)
                             aggregator.update("Game/ep_len_avg", ep_len)
-                        fabric.print(f"Rank-0: policy_step={policy_step}, reward_env_{i}={ep_rew[-1]}")
+                        fabric.print(f"Rank-0: policy_step={policy_step}, env={i}, reward={ep_rew[-1]}, length={ep_len[-1]}")
 
             # Save the real next observation
             real_next_obs = copy.deepcopy(next_obs)

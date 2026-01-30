@@ -22,6 +22,14 @@ algo:
     encoder: [rgb]
     decoder: [rgb]
 
+  world_model:
+    encoder:
+      cnn_channels_multiplier: 4
+    transformer:
+      num_heads: 4
+      embed_dim: 128
+      dim_feedforward: 512
+
 # Checkpoint
 checkpoint:
   every: 100000
