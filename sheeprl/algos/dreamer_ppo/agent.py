@@ -91,10 +91,10 @@ class RSSM(nn.Module):
         self.discrete_size = discrete_size
         self.unimix = unimix
 
-    def dynamic(self, embedded_obs: Tensor, actions: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    def dynamic(self, embedded_obs: Tensor, actions: Tensor, terminated: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         logits, stochastic_state = self._representation(embedded_obs)
         latent_state = choose_latent_state(logits, stochastic_state)
-        next_logits, next_stochastic_state = self._transition(latent_state, actions)
+        next_logits, next_stochastic_state = self._transition(latent_state, actions, terminated)
         return logits, stochastic_state, next_logits, next_stochastic_state
 
     def _representation(self, embedded_obs: Tensor) -> Tuple[Tensor, Tensor]:
@@ -102,8 +102,10 @@ class RSSM(nn.Module):
         logits = self._uniform_mix(logits)
         return logits, compute_stochastic_state(logits, discrete=self.discrete_size)
 
-    def _transition(self, latent_state: Tensor, actions: Tensor) -> Tuple[Tensor, Tensor]:
+    def _transition(self, latent_state: Tensor, actions: Tensor, terminated: Tensor = None) -> Tuple[Tensor, Tensor]:
         mixed = torch.concat([latent_state, actions], -1)
+        if terminated is not None:
+            mixed = mixed * (1 - terminated)
         next_logits = self.transition_model(mixed)
         next_logits = self._uniform_mix(next_logits)
         return next_logits, compute_stochastic_state(next_logits, discrete=self.discrete_size)
@@ -378,7 +380,7 @@ def train_world_model(
     actions = data["actions"]
 
     embedded_obs = world_model.encoder(batch_obs)
-    logits, stochastic_state, next_prior_logits, next_prior_stochastic_state = world_model.rssm.dynamic(embedded_obs, actions)
+    logits, stochastic_state, next_prior_logits, next_prior_stochastic_state = world_model.rssm.dynamic(embedded_obs, actions, data["terminated"])
     latent_states = choose_latent_state(logits, stochastic_state)
     next_prior_latent_states = choose_latent_state(next_prior_logits, next_prior_stochastic_state)
     reconstructed_obs = world_model.observation_model(latent_states)
