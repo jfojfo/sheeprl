@@ -27,10 +27,11 @@ algo:
     discrete_size: 8
     stochastic_size: 16
     encoder:
-      cnn_channels_multiplier: 3
+      cnn_channels_multiplier: 8
     transformer:
       num_heads: 8
       embed_dim: 128
+      dim_feedforward: 512
     transition_model:
       hidden_size: 128
     representation_model:
