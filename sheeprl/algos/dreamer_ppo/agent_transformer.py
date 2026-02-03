@@ -340,8 +340,8 @@ class PlayerDV3(nn.Module):
             self.seq_obs = {k: torch.empty(0, num_envs, *obs[k].shape[2:]).to(self.device) for k in obs}
             self.seq_is_first = torch.empty(0, num_envs, 1).to(self.device)
 
-        self.seq_obs = {k: torch.cat([self.seq_obs[k], obs[k]], dim=0)[:seq_len] for k in obs}
-        self.seq_is_first = torch.cat([self.seq_is_first, is_first], dim=0)[:seq_len]
+        self.seq_obs = {k: torch.cat([self.seq_obs[k], obs[k]], dim=0)[-seq_len:] for k in obs}
+        self.seq_is_first = torch.cat([self.seq_is_first, is_first], dim=0)[-seq_len:]
 
         embedded_obs = self.world_model.encoder(self.seq_obs)
         logits, stochastic_state = self.world_model._representation(embedded_obs, self.seq_is_first)

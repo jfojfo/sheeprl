@@ -134,8 +134,8 @@ class WorldModel(nn.Module):
         self.unimix = cfg.algo.unimix
 
         world_model_cfg = cfg.algo.world_model
-        stochastic_size = world_model_cfg.stochastic_size * world_model_cfg.discrete_size
-        latent_state_size = stochastic_size
+        stoch_state_size = world_model_cfg.stochastic_size * world_model_cfg.discrete_size
+        latent_state_size = stoch_state_size + world_model_cfg.transformer.embed_dim
 
         # smaller cnn_channels_multiplier 4 or 8
         cnn_stages = int(np.log2(cfg.env.screen_size) - np.log2(4))
@@ -154,7 +154,7 @@ class WorldModel(nn.Module):
         representation_ln_cls = hydra.utils.get_class(world_model_cfg.representation_model.layer_norm.cls)
         representation_model = MLP(
             input_dims=encoder.output_dim,
-            output_dim=stochastic_size,
+            output_dim=stoch_state_size,
             hidden_sizes=[world_model_cfg.representation_model.hidden_size],
             activation=hydra.utils.get_class(world_model_cfg.representation_model.dense_act),
             layer_args={"bias": representation_ln_cls == nn.Identity},
@@ -172,12 +172,12 @@ class WorldModel(nn.Module):
             world_model_cfg.transformer.num_heads,
             world_model_cfg.transformer.dim_feedforward,
         )
-        assert world_model_cfg.transformer.embed_dim == stochastic_size
+        assert world_model_cfg.transformer.embed_dim == stoch_state_size
 
         transition_ln_cls = hydra.utils.get_class(world_model_cfg.transition_model.layer_norm.cls)
         transition_model = MLP(
-            input_dims=latent_state_size + int(sum(actions_dim)),
-            output_dim=stochastic_size,
+            input_dims=world_model_cfg.transformer.embed_dim + int(sum(actions_dim)),
+            output_dim=stoch_state_size,
             hidden_sizes=[world_model_cfg.transition_model.hidden_size],
             activation=hydra.utils.get_class(world_model_cfg.transition_model.dense_act),
             layer_args={"bias": transition_ln_cls == nn.Identity},
@@ -265,24 +265,26 @@ class WorldModel(nn.Module):
         logits = logits.view(*logits.shape[:-2], -1)
         return logits
 
-    def dynamic(self, embedded_obs: Tensor, actions: Tensor, is_first: Tensor, terminated: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        logits, stochastic_state = self._representation(embedded_obs)
-        latent_state = choose_latent_state(logits, stochastic_state)
+    def dynamic(self, embedded_obs: Tensor, actions: Tensor, is_first: Tensor, terminated: Tensor) \
+            -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        logits, stochastic_state, attn_output = self._representation(embedded_obs, is_first)
+        next_logits, next_stochastic_state = self._transition(attn_output, actions, terminated)
+        return logits, stochastic_state, next_logits, next_stochastic_state, attn_output
+
+    def _representation(self, embedded_obs: Tensor, is_first: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        logits = self.representation_model(embedded_obs)
+        logits = self._uniform_mix(logits)
+        stochastic_state = compute_stochastic_state(logits, discrete=self.discrete_size)
+        posterior = stochastic_state.view(*stochastic_state.shape[:-2], -1)
 
         attn_mask, _ = generate_attention_mask(is_first.squeeze(-1).transpose(0, 1))
         num_heads = self.cfg.algo.world_model.transformer.num_heads
         # a a a, b b b, c c c
         attn_mask = attn_mask.unsqueeze(1).expand(-1, num_heads, -1, -1).reshape(-1, *attn_mask.shape[-2:])
         # attn_mask = attn_mask.repeat_interleave(repeats=self.cfg.algo.world_model.transformer.num_heads, dim=0)
-        attn_output, _, _ = self.transformer(latent_state, latent_state, attn_mask=attn_mask)
+        attn_output, _, _ = self.transformer(posterior, posterior, attn_mask=attn_mask)
 
-        next_logits, next_stochastic_state = self._transition(attn_output, actions, terminated)
-        return logits, stochastic_state, next_logits, next_stochastic_state
-
-    def _representation(self, embedded_obs: Tensor) -> Tuple[Tensor, Tensor]:
-        logits = self.representation_model(embedded_obs)
-        logits = self._uniform_mix(logits)
-        return logits, compute_stochastic_state(logits, discrete=self.discrete_size)
+        return logits, stochastic_state, attn_output
 
     def _transition(self, latent_state: Tensor, actions: Tensor, terminated: Tensor=None) -> Tuple[Tensor, Tensor]:
         mixed = torch.concat([latent_state, actions], -1)
@@ -293,10 +295,10 @@ class WorldModel(nn.Module):
         next_logits = self._uniform_mix(next_logits)
         return next_logits, compute_stochastic_state(next_logits, discrete=self.discrete_size)
 
-    def imagination(self, latent_state: Tensor, actions: Tensor, kv_cache: tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
-        attn_output, kv_cache, _ = self.transformer(latent_state, latent_state, kv_cache=kv_cache)
+    def imagination(self, prior: Tensor, actions: Tensor, kv_cache: tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        attn_output, kv_cache, _ = self.transformer(prior, prior, kv_cache=kv_cache)
         logits, stochastic_state = self._transition(attn_output, actions)
-        return logits, stochastic_state, kv_cache
+        return logits, stochastic_state, attn_output, kv_cache
 
 
 class PlayerDV3(nn.Module):
@@ -328,19 +330,20 @@ class PlayerDV3(nn.Module):
         greedy: bool = False,
         mask: Optional[Dict[str, Tensor]] = None,
     ) -> Sequence[Tensor]:
-        # cfg = self.cfg
-        # seq_len = cfg.algo.per_rank_sequence_length
-        # num_envs = cfg.env.num_envs
-        # if self.seq_obs is None:
-        #     self.seq_obs = {k: torch.empty(0, num_envs, *obs[k].shape[2:]).to(self.device) for k in obs}
-        #     self.seq_is_first = torch.empty(0, num_envs, 1).to(self.device)
-        # self.seq_obs = {k: torch.cat([self.seq_obs[k], obs[k]], dim=0)[:seq_len] for k in obs}
-        # self.seq_is_first = torch.cat([self.seq_is_first, is_first], dim=0)[:seq_len]
-        # embedded_obs = self.world_model.encoder(self.seq_obs)
+        cfg = self.cfg
+        seq_len = cfg.algo.per_rank_sequence_length
+        num_envs = cfg.env.num_envs
+        if self.seq_obs is None:
+            self.seq_obs = {k: torch.empty(0, num_envs, *obs[k].shape[2:]).to(self.device) for k in obs}
+            self.seq_is_first = torch.empty(0, num_envs, 1).to(self.device)
+        self.seq_obs = {k: torch.cat([self.seq_obs[k], obs[k]], dim=0)[-seq_len:] for k in obs}
+        self.seq_is_first = torch.cat([self.seq_is_first, is_first], dim=0)[-seq_len:]
 
-        embedded_obs = self.world_model.encoder(obs)
-        logits, stochastic_state = self.world_model._representation(embedded_obs)
-        latent_state = choose_latent_state(logits, stochastic_state)
+        seq_embedded_obs = self.world_model.encoder(self.seq_obs)
+        logits, stochastic_state, attn_output = self.world_model._representation(seq_embedded_obs, self.seq_is_first)
+        posterior = stochastic_state.view(*stochastic_state.shape[:-2], -1)
+        latent_state = torch.cat([posterior[-1:], attn_output[-1:]], dim=-1)
+
         actions, _ = self.actor(latent_state, greedy, mask)
         return actions
 
@@ -357,7 +360,7 @@ def build_agent(
     critic_cfg = cfg.algo.critic
 
     stochastic_size = world_model_cfg.stochastic_size * world_model_cfg.discrete_size
-    latent_state_size = stochastic_size
+    latent_state_size = stochastic_size + world_model_cfg.transformer.embed_dim
 
     world_model = WorldModel(cfg, actions_dim, obs_space, is_continuous)
 
@@ -460,9 +463,11 @@ def train(
 
     # Embed observations from the environment
     embedded_obs = world_model.encoder(batch_obs)
-    logits, stochastic_state, next_prior_logits, next_prior_stochastic_state = world_model.dynamic(embedded_obs, data["actions"], data["is_first"], data["terminated"])
-    latent_states = choose_latent_state(logits, stochastic_state)
-    next_prior_latent_states = choose_latent_state(next_prior_logits, next_prior_stochastic_state)
+    logits, stochastic_state, next_prior_logits, _, attn_output = world_model.dynamic(
+        embedded_obs, data["actions"], data["is_first"], data["terminated"])
+    posterior = stochastic_state.view(*stochastic_state.shape[:-2], stoch_state_size)
+
+    latent_states = torch.cat([posterior, attn_output], dim=-1)
     reconstructed_obs = world_model.observation_model(latent_states)
 
     # Compute the distribution over the reconstructed observations
@@ -558,6 +563,7 @@ def train(
         data["actions"].shape[-1],
         device=device,
     )
+    imagined_prior = posterior.reshape(1, -1, stoch_state_size)
     imagined_latent_state = latent_states.reshape(1, -1, latent_states_size)
     actions = torch.cat(actor(imagined_latent_state.detach())[0], dim=-1)
     imagined_trajectories[0] = imagined_latent_state
@@ -576,13 +582,15 @@ def train(
     # where z0 comes from the posterior, while z'i is the imagined states (prior)
 
     kv_cache = (
-        torch.empty(0, *imagined_latent_state.shape[1:]).to(device),
-        torch.empty(0, *imagined_latent_state.shape[1:]).to(device),
+        torch.empty(0, *imagined_prior.shape[1:]).to(device),
+        torch.empty(0, *imagined_prior.shape[1:]).to(device),
     )
     # Imagine trajectories in the latent space
     for i in range(1, cfg.algo.horizon + 1):
-        imagined_logits, imagined_stochastic_state, kv_cache = world_model.imagination(imagined_latent_state, actions, kv_cache)
-        imagined_latent_state = choose_latent_state(imagined_logits, imagined_stochastic_state)
+        imagined_logits, imagined_stochastic_state, imagined_attn_output, kv_cache = world_model.imagination(
+            imagined_prior, actions, kv_cache)
+        imagined_prior = imagined_stochastic_state.view(*imagined_stochastic_state.shape[:-2], stoch_state_size)
+        imagined_latent_state = torch.cat([imagined_prior, imagined_attn_output], dim=-1)
         imagined_trajectories[i] = imagined_latent_state
         actions = torch.cat(actor(imagined_latent_state.detach())[0], dim=-1)
         imagined_actions[i] = actions
