@@ -114,7 +114,7 @@ class MyTransformerEncoderLayer(nn.Module):
             norm_src_kv = norm_src
         else:
             norm_src_kv = self.norm1(kv_input)
-        attn_output, w = self.self_attn(norm_src, norm_src_kv, norm_src_kv,
+        attn_output, w = self.self_attn(norm_src, norm_src_kv, kv_input, # no norm for value
                                         kv_cache=kv_cache,
                                         attn_mask=attn_mask)
         # src2: [src_len,batch_size,num_heads*kdim] num_heads*kdim = embed_dim
@@ -265,10 +265,10 @@ class WorldModel(nn.Module):
         logits = logits.view(*logits.shape[:-2], -1)
         return logits
 
-    def dynamic(self, embedded_obs: Tensor, actions: Tensor, is_first: Tensor, terminated: Tensor) \
+    def dynamic(self, embedded_obs: Tensor, actions: Tensor, is_first: Tensor) \
             -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         logits, stochastic_state, attn_output = self._representation(embedded_obs, is_first)
-        next_logits, next_stochastic_state = self._transition(attn_output, actions, terminated)
+        next_logits, next_stochastic_state = self._transition(attn_output, actions)
         return logits, stochastic_state, next_logits, next_stochastic_state, attn_output
 
     def _representation(self, embedded_obs: Tensor, is_first: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
@@ -286,11 +286,8 @@ class WorldModel(nn.Module):
 
         return logits, stochastic_state, attn_output
 
-    def _transition(self, latent_state: Tensor, actions: Tensor, terminated: Tensor=None) -> Tuple[Tensor, Tensor]:
+    def _transition(self, latent_state: Tensor, actions: Tensor) -> Tuple[Tensor, Tensor]:
         mixed = torch.concat([latent_state, actions], -1)
-        #  None for imagination
-        if terminated is not None:
-            mixed = mixed * (1 - terminated)
         next_logits = self.transition_model(mixed)
         next_logits = self._uniform_mix(next_logits)
         return next_logits, compute_stochastic_state(next_logits, discrete=self.discrete_size)
@@ -464,7 +461,7 @@ def train(
     # Embed observations from the environment
     embedded_obs = world_model.encoder(batch_obs)
     logits, stochastic_state, next_prior_logits, _, attn_output = world_model.dynamic(
-        embedded_obs, data["actions"], data["is_first"], data["terminated"])
+        embedded_obs, data["actions"], data["is_first"])
     posterior = stochastic_state.view(*stochastic_state.shape[:-2], stoch_state_size)
 
     latent_states = torch.cat([posterior, attn_output], dim=-1)
@@ -511,7 +508,7 @@ def train(
         Independent(OneHotCategoricalStraightThrough(logits=prior_logits.detach()), 1),
     )
     repr_loss = kl_representation * torch.maximum(repr_loss, free_nats)
-    kl_loss = dyn_loss + repr_loss
+    kl_loss = (dyn_loss + repr_loss) * continues_targets[:-1].squeeze(-1) # exclude state(terminated -> is_first)
 
     continue_scale_factor = cfg.algo.world_model.continue_scale_factor
     if pc is not None and continues_targets is not None:
