@@ -24,7 +24,7 @@ from sheeprl.utils.distribution import MSEDistribution, TwoHotEncodingDistributi
 from sheeprl.utils.metric import MetricAggregator
 
 
-class RoPEPosition(nn.Module):
+class ReverseRoPEPosition(nn.Module):
     def __init__(self, dim, max_seq_len=512):
         super().__init__()
 
@@ -50,25 +50,27 @@ class RoPEPosition(nn.Module):
         return freqs_cis.view(*shape)
 
     def forward(self, x):
+        x = x.flip(dims=[1])
         x_ = torch.view_as_complex(x.reshape(*x.shape[:-1], -1, 2))
         freqs_cis = self._reshape_for_broadcast(x_)
         x_out = torch.view_as_real(x_ * freqs_cis).flatten(-2)
+        x_out = x_out.flip(dims=[1])
         return x_out.type_as(x)
 
-    def forward_qk(self, xq, xk):
-        """
-        Args:
-            xq (Tensor): Query tensor, shape (batch_size, seq_len, embed_dim).
-            xk (Tensor): Key tensor, shape (batch_size, seq_len, embed_dim).
-        Returns:
-            Tuple[Tensor, Tensor]: RoPE-applied Query and Key tensors, same shapes as inputs.
-        """
-        xq_ = torch.view_as_complex(xq.reshape(*xq.shape[:-1], -1, 2))
-        xk_ = torch.view_as_complex(xk.reshape(*xk.shape[:-1], -1, 2))
-        freqs_cis = self._reshape_for_broadcast(xq_)
-        xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(-2)
-        xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(-2)
-        return xq_out.type_as(xq), xk_out.type_as(xk)
+    # def forward_qk(self, xq, xk):
+    #     """
+    #     Args:
+    #         xq (Tensor): Query tensor, shape (batch_size, seq_len, embed_dim).
+    #         xk (Tensor): Key tensor, shape (batch_size, seq_len, embed_dim).
+    #     Returns:
+    #         Tuple[Tensor, Tensor]: RoPE-applied Query and Key tensors, same shapes as inputs.
+    #     """
+    #     xq_ = torch.view_as_complex(xq.reshape(*xq.shape[:-1], -1, 2))
+    #     xk_ = torch.view_as_complex(xk.reshape(*xk.shape[:-1], -1, 2))
+    #     freqs_cis = self._reshape_for_broadcast(xq_)
+    #     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(-2)
+    #     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(-2)
+    #     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 class MySelfAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, max_seq_len=512, dropout=None):
@@ -84,7 +86,7 @@ class MySelfAttention(nn.Module):
         self.k_proj = nn.Linear(embed_dim, embed_dim)
         self.v_proj = nn.Linear(embed_dim, embed_dim)
 
-        self.rope = RoPEPosition(self.head_dim, max_seq_len=max_seq_len)
+        self.rope = ReverseRoPEPosition(self.head_dim, max_seq_len=max_seq_len)
 
         # Output linear transformation
         self.out_proj = nn.Linear(embed_dim, embed_dim)
@@ -140,7 +142,7 @@ class MyTransformerEncoderLayer(nn.Module):
         :param dropout:         丢弃率，论文中的默认值为 0.1    
         """
         # self.self_attn = MySelfAttention(embed_dim, num_heads, dropout=dropout)
-        self.self_attn = MySelfAttention(embed_dim, num_heads, max_seq_len=max_seq_len, dropout=dropout)
+        self.self_attn = MySelfAttention(embed_dim, num_heads, max_seq_len=max_seq_len, dropout=None)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(embed_dim)
 
@@ -164,7 +166,7 @@ class MyTransformerEncoderLayer(nn.Module):
             norm_src_kv = norm_src
         else:
             norm_src_kv = self.norm1(kv_input)
-        attn_output, w = self.self_attn(norm_src, norm_src_kv, kv_input, # no norm for value
+        attn_output, w = self.self_attn(norm_src, norm_src_kv, norm_src_kv,
                                         kv_cache=kv_cache,
                                         attn_mask=attn_mask)
         # src2: [src_len,batch_size,num_heads*kdim] num_heads*kdim = embed_dim
