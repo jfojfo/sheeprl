@@ -223,7 +223,9 @@ def make_env(
             if cfg.env.grayscale:
                 env = GrayscaleRenderWrapper(env)
             env = gym.experimental.wrappers.RecordVideoV0(
-                env, os.path.join(run_name, prefix + "_videos" if prefix else "videos"), disable_logger=True
+                env, os.path.join(run_name, prefix + "_videos" if prefix else "videos"),
+                episode_trigger=lambda episode_id: (episode_id > 0 and episode_id % cfg.env.capture_video_episodes == 0),
+                disable_logger=True
             )
             env.metadata["render_fps"] = env.frames_per_sec
         return env

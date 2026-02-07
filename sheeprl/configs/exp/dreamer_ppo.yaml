@@ -39,6 +39,9 @@ buffer:
   size: 1000000
   checkpoint: False
 
+env:
+  capture_video_episodes: 10
+
 # Distribution
 distribution:
   type: "auto"
