@@ -24,11 +24,7 @@ algo:
 
   world_model:
     encoder:
-      cnn_channels_multiplier: 4
-    transformer:
-      num_heads: 4
-      embed_dim: 128
-      dim_feedforward: 512
+      cnn_channels_multiplier: 32
 
 # Checkpoint
 checkpoint:
