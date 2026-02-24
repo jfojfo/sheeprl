@@ -437,9 +437,9 @@ class PlayerDV3(nn.Module):
         else:
             attn_output = self.world_model._attn_output(stochastic_state[:-1], self.seq_action, self.seq_is_first[:-1])
 
-        is_first_mask = self.seq_is_first[:-1].squeeze(-1).bool()
+        is_first_mask = self.seq_is_first[1:].squeeze(-1).bool()
         if is_first_mask.any():
-            initial_state = self.world_model.get_initial_states(is_first_mask.shape[0:0])
+            initial_state = self.world_model.get_initial_states([])
             attn_output[is_first_mask] = initial_state
 
         latent_state = self.world_model.latent(stochastic_state[-1:], attn_output[-1:])

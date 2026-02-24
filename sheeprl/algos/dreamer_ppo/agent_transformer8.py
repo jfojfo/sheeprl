@@ -435,16 +435,29 @@ class PlayerDV3(nn.Module):
             self.seq_action = torch.empty(0, num_envs, sum(self.actions_dim)).to(self.device)
         self.seq_obs = {k: torch.cat([self.seq_obs[k], obs[k]], dim=0)[-seq_len:] for k in obs}
         self.seq_is_first = torch.cat([self.seq_is_first, is_first], dim=0)[-seq_len:]
-        fake_action = torch.zeros((1, num_envs, sum(self.actions_dim)), dtype=torch.float32).to(self.device)
-        self.seq_action = torch.cat([self.seq_action, fake_action], dim=0)[-seq_len:]
+        # fake_action = torch.zeros((1, num_envs, sum(self.actions_dim)), dtype=torch.float32).to(self.device)
+        # self.seq_action = torch.cat([self.seq_action, fake_action], dim=0)[-seq_len:]
 
         seq_embedded_obs = self.world_model.encoder(self.seq_obs)
         logits, stochastic_state = self.world_model._representation(seq_embedded_obs)
-        attn_output = self.world_model._get_history_state(stochastic_state, self.seq_action, self.seq_is_first)
+
+        if self.seq_action.shape[0] == 0:
+            embed_seq = self.world_model.get_initial_states([1, num_envs])
+            attn_output = self.world_model._attn_output(embed_seq, self.seq_is_first)
+        else:
+            posterior = stochastic_state.view(*stochastic_state.shape[:-2], -1)
+            embed_seq = torch.cat([self.world_model.embed_state(posterior[:-1]), self.world_model.embed_action(self.seq_action)], dim=-1)
+            is_first_mask = self.seq_is_first[1:].squeeze(-1).bool()
+            if is_first_mask.any():
+                initial_state = self.world_model.get_initial_states([])
+                embed_seq[is_first_mask] = initial_state
+            attn_output = self.world_model._attn_output(embed_seq, self.seq_is_first[1:])
+
         latent_state = self.world_model.latent(stochastic_state[-1:], attn_output[-1:])
 
         actions, _ = self.actor(latent_state[-1:], greedy, mask)
-        self.seq_action[-1:] = torch.cat(actions, dim=-1)
+        self.seq_action = torch.cat([self.seq_action, torch.cat(actions, dim=-1)], dim=0)[-(seq_len-1):]
+        # self.seq_action[-1:] = torch.cat(actions, dim=-1)
         return actions
 
 
