@@ -22,6 +22,7 @@ import sheeprl.algos.dreamer_ppo.agent_transformer4
 import sheeprl.algos.dreamer_ppo.agent_transformer5
 import sheeprl.algos.dreamer_ppo.agent_transformer6
 import sheeprl.algos.dreamer_ppo.agent_transformer7
+import sheeprl.algos.dreamer_ppo.agent_transformer7_1
 import sheeprl.algos.dreamer_ppo.agent_transformer8
 import sheeprl.algos.dreamer_ppo.agent_transformer9
 from sheeprl.algos.dreamer_v3.utils import prepare_obs, Moments, test
@@ -35,8 +36,8 @@ from sheeprl.utils.timer import timer
 from sheeprl.utils.utils import save_configs, Ratio
 
 
-F_BUILD_AGENT = sheeprl.algos.dreamer_ppo.agent_transformer9.build_agent
-F_TRAIN = sheeprl.algos.dreamer_ppo.agent_transformer9.train
+F_BUILD_AGENT = sheeprl.algos.dreamer_ppo.agent_transformer7_1.build_agent
+F_TRAIN = sheeprl.algos.dreamer_ppo.agent_transformer7_1.train
 SAMPLE_NEXT_OBS = False
 
 @register_algorithm()
