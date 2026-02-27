@@ -27,7 +27,7 @@ MODELS_TO_REGISTER = {"world_model", "actor", "critic"}
 def choose_latent_state(logits: Tensor, stochastic_state: Tensor) -> Tensor:
     return stochastic_state.view(*stochastic_state.shape[:-2], -1)
 
-def generate_attention_mask(is_first_seq: Tensor):
+def generate_attention_mask(is_first_seq: Tensor) -> Tuple[Tensor, Tensor]:
     """
     Generates attention masks for gym game sequences with episode resets indicated by 1s.
     Rule for intermediate key_padding_mask:
@@ -82,6 +82,43 @@ def generate_attention_mask(is_first_seq: Tensor):
     final_mask = key_padding_mask | causal_mask
 
     return final_mask, key_padding_mask
+
+def apply_lower_triangle_mask(mask: Tensor) -> Tensor:
+    """
+    Applies a lower triangular mask to the attention mask, setting all elements
+    in the lower-left triangle (strictly below the main diagonal) to True.
+
+    This is useful when you want to mask out past positions within episodes
+    while still respecting episode boundaries defined by the key_padding_mask.
+
+    Args:
+        mask (torch.Tensor): Boolean attention mask. Shape: [batch_size, seq_len, key_seq_len]
+                             or [seq_len, key_seq_len]. True means MASK OUT (ignore).
+
+    Returns:
+        torch.Tensor: Modified attention mask with lower triangle (excluding diagonal) set to True.
+                      Shape: same as input.
+    """
+    seq_len = mask.shape[-2]
+    key_seq_len = mask.shape[-1]
+    device = mask.device
+
+    # Create lower triangular mask for (possibly non-square) matrix
+    # For position (i, j), it's in lower triangle if i > j (strictly below diagonal)
+    lower_tri_mask = torch.zeros((seq_len, key_seq_len), dtype=torch.bool, device=device)
+    for i in range(seq_len):
+        # Mark positions where j < i as True (strictly lower triangle, excluding diagonal)
+        lower_tri_mask[i, : min(i, key_seq_len)] = True
+
+    # Expand to batch size if needed
+    if mask.dim() == 3:
+        lower_tri_mask = lower_tri_mask.unsqueeze(0).expand(mask.shape[0], -1, -1)
+
+    # Set lower triangle positions to True (mask out)
+    # mask | lower_tri_mask: combine existing mask with lower triangle mask
+    result = mask | lower_tri_mask
+
+    return result
 
 
 if __name__ == "__main__":
@@ -156,3 +193,62 @@ if __name__ == "__main__":
     assert (mask == result_mask).all()
     print(key_padding_mask)
     print(mask)
+
+    # Test apply_lower_triangle_mask
+    print("\n--- Testing apply_lower_triangle_mask (square) ---")
+    processed_mask = apply_lower_triangle_mask(mask)
+    print(processed_mask)
+
+    # Verify that lower triangle (excluding diagonal) is now all True
+    seq_len = mask.shape[-1]
+    lower_tri_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool), diagonal=-1)
+    for i in range(mask.shape[0]):
+        # Check that lower triangle positions are True in the result
+        # Only check positions where lower_tri_mask is True
+        batch_lower_tri = processed_mask[i][lower_tri_mask]
+        assert batch_lower_tri.all(), f"Lower triangle should be all True for batch {i}"
+    print("Lower triangle mask test (square) passed!")
+
+    # ============================================================
+    # Non-square mask tests
+    # ============================================================
+    
+    # Test 1: key_seq_len = 2 * seq_len (expanded key sequence)
+    print("\n--- Testing apply_lower_triangle_mask (non-square, expanded) ---")
+    key_seq_len_exp = 2 * seq_len
+    # Create a non-square mask for testing
+    mask_ns_exp = torch.zeros((5, seq_len, key_seq_len_exp), dtype=torch.bool)
+    mask_ns_exp[:, :, :seq_len] = mask  # Copy square part
+    
+    print("Original expanded mask:")
+    print(mask_ns_exp)
+    
+    processed_mask_ns_exp = apply_lower_triangle_mask(mask_ns_exp)
+    print(f"Expanded mask shape: {mask_ns_exp.shape} -> {processed_mask_ns_exp.shape}")
+    print("Processed expanded mask:")
+    print(processed_mask_ns_exp)
+    
+    # Verify lower triangle is True for expanded mask
+    for i in range(processed_mask_ns_exp.shape[0]):
+        for row in range(seq_len):
+            for col in range(min(row, key_seq_len_exp)):
+                assert processed_mask_ns_exp[i, row, col], f"Position ({row}, {col}) should be True"
+    print("Lower triangle mask test (non-square, expanded) passed!")
+
+    # Test 2: key_seq_len < seq_len (truncated key sequence)
+    print("\n--- Testing apply_lower_triangle_mask (non-square, truncated) ---")
+    key_seq_len_short = 3
+    mask_ns_short = mask[:, :, :key_seq_len_short].clone()
+    
+    processed_mask_ns_short = apply_lower_triangle_mask(mask_ns_short)
+    print(f"Truncated mask shape: {mask_ns_short.shape} -> {processed_mask_ns_short.shape}")
+    print(processed_mask_ns_short)
+    
+    # Verify lower triangle is True for truncated mask
+    for i in range(processed_mask_ns_short.shape[0]):
+        for row in range(seq_len):
+            for col in range(min(row, key_seq_len_short)):
+                assert processed_mask_ns_short[i, row, col], f"Position ({row}, {col}) should be True"
+    print("Lower triangle mask test (non-square, truncated) passed!")
+    
+    print("\n=== All tests passed! ===")

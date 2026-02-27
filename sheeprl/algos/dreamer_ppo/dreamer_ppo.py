@@ -25,6 +25,7 @@ import sheeprl.algos.dreamer_ppo.agent_transformer7
 import sheeprl.algos.dreamer_ppo.agent_transformer7_1
 import sheeprl.algos.dreamer_ppo.agent_transformer8
 import sheeprl.algos.dreamer_ppo.agent_transformer9
+import sheeprl.algos.dreamer_ppo.agent_transformer10
 from sheeprl.algos.dreamer_v3.utils import prepare_obs, Moments, test
 from sheeprl.data.buffers import EnvIndependentReplayBuffer, SequentialReplayBuffer
 from sheeprl.envs.wrappers import RestartOnException
@@ -36,8 +37,8 @@ from sheeprl.utils.timer import timer
 from sheeprl.utils.utils import save_configs, Ratio
 
 
-F_BUILD_AGENT = sheeprl.algos.dreamer_ppo.agent_transformer7_1.build_agent
-F_TRAIN = sheeprl.algos.dreamer_ppo.agent_transformer7_1.train
+F_BUILD_AGENT = sheeprl.algos.dreamer_ppo.agent_transformer10.build_agent
+F_TRAIN = sheeprl.algos.dreamer_ppo.agent_transformer10.train
 SAMPLE_NEXT_OBS = False
 
 @register_algorithm()
@@ -191,6 +192,10 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
     step_data["is_first"] = np.ones_like(step_data["terminated"])
     player.init_states()
 
+    seq_len = cfg.algo.per_rank_sequence_length
+    if cfg.algo.world_model.transformer and cfg.algo.world_model.transformer.lookback_seq_len:
+        seq_len += cfg.algo.world_model.transformer.lookback_seq_len
+
     cumulative_per_rank_gradient_steps = 0
     for iter_num in range(start_iter, total_iters + 1):
         policy_step += policy_steps_per_iter
@@ -311,7 +316,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                     for i in range(per_rank_gradient_steps):
                         local_data = rb.sample_tensors(
                             cfg.algo.per_rank_batch_size,
-                            sequence_length=cfg.algo.per_rank_sequence_length,
+                            sequence_length=seq_len,
                             n_samples=per_rank_gradient_steps,
                             sample_next_obs=SAMPLE_NEXT_OBS,
                             dtype=None,
