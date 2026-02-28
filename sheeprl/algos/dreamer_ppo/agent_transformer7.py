@@ -344,7 +344,14 @@ class WorldModel(nn.Module):
             -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         posterior_logits, posterior_stochastic_state = self._representation(embedded_obs)
         attn_output = self._attn_output(posterior_stochastic_state, actions, is_first)
-        attn_output = self._shift_and_mask(attn_output, is_first)
+
+        attn_output = torch.cat((torch.zeros_like(attn_output[:1]), attn_output[:-1]), dim=0)
+        # 对于is_first为1的位置，重置attn_output为初始状态
+        is_first_mask = is_first.squeeze(-1).bool()
+        if is_first_mask.any():
+            initial_state = self.get_initial_states([])
+            attn_output[is_first_mask] = initial_state
+
         prior_logits, prior_stochastic_state = self._transition(attn_output)
         return posterior_logits, posterior_stochastic_state, prior_logits, prior_stochastic_state, attn_output
 
@@ -363,16 +370,6 @@ class WorldModel(nn.Module):
         attn_mask = attn_mask.unsqueeze(1).expand(-1, num_heads, -1, -1).reshape(-1, *attn_mask.shape[-2:])
         # attn_mask = attn_mask.repeat_interleave(repeats=self.cfg.algo.world_model.transformer.num_heads, dim=0)
         attn_output, _, _ = self.transformer(embed_seq, embed_seq, attn_mask=attn_mask)
-        return attn_output
-
-    def _shift_and_mask(self, attn_output: Tensor, is_first: Tensor) -> Tensor:
-        # 右移1位可与posterior对齐
-        attn_output = torch.cat((self.get_initial_states(attn_output[:1].shape[:2]), attn_output[:-1]), dim=0)
-        # 对于is_first为1的位置，重置attn_output为初始状态
-        is_first_mask = is_first.squeeze(-1).bool()
-        if is_first_mask.any():
-            initial_state = self.get_initial_states([])
-            attn_output[is_first_mask] = initial_state
         return attn_output
 
     def _representation(self, embedded_obs: Tensor) -> Tuple[Tensor, Tensor]:
@@ -438,16 +435,17 @@ class PlayerDV3(nn.Module):
         if self.seq_action.shape[0] == 0:
             attn_output = self.world_model.get_initial_states([1, num_envs])
         else:
-            fake_action = torch.zeros_like(self.seq_action[-1:])
-            seq_action = torch.cat([self.seq_action, fake_action], dim=0)[-seq_len:]
-            attn_output = self.world_model._attn_output(stochastic_state, seq_action, self.seq_is_first)
-            # shift掉最后一个fake attn，shift补进去的第一个也不会使用（latent_state取最后一个attn）
-            attn_output = self.world_model._shift_and_mask(attn_output, self.seq_is_first)
+            attn_output = self.world_model._attn_output(stochastic_state[:-1], self.seq_action, self.seq_is_first[:-1])
+
+        is_first_mask = self.seq_is_first[1:].squeeze(-1).bool()
+        if is_first_mask.any():
+            initial_state = self.world_model.get_initial_states([])
+            attn_output[is_first_mask] = initial_state
 
         latent_state = self.world_model.latent(stochastic_state[-1:], attn_output[-1:])
 
         actions, _ = self.actor(latent_state[-1:], greedy, mask)
-        self.seq_action = torch.cat([self.seq_action, torch.cat(actions, dim=-1)], dim=0)[-seq_len:]
+        self.seq_action = torch.cat([self.seq_action, torch.cat(actions, dim=-1)], dim=0)[-(seq_len-1):]
         return actions
 
 
