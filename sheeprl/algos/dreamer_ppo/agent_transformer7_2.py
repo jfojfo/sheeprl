@@ -367,7 +367,7 @@ class WorldModel(nn.Module):
 
     def _shift_and_mask(self, attn_output: Tensor, is_first: Tensor) -> Tensor:
         # 右移1位可与posterior对齐
-        attn_output = torch.cat((self.get_initial_states(attn_output[:1].shape[:2]), attn_output[:-1]), dim=0)
+        attn_output = torch.cat((torch.zeros_like(attn_output[:1]), attn_output[:-1]), dim=0)
         # 对于is_first为1的位置，重置attn_output为初始状态
         is_first_mask = is_first.squeeze(-1).bool()
         if is_first_mask.any():
@@ -440,7 +440,7 @@ class PlayerDV3(nn.Module):
         else:
             fake_action = torch.zeros_like(self.seq_action[-1:])
             seq_action = torch.cat([self.seq_action, fake_action], dim=0)[-seq_len:] # 可能shift，shift后位置就一致了
-            # keep seq len to 63, ReverseRoPE 在绝对位置变化时不能保持相对位置一致性
+            # keep seq len to 63
             attn_output = self.world_model._attn_output(stochastic_state[:-1], seq_action[:-1], self.seq_is_first[:-1])
             # shift掉最后一个fake attn，shift补进去的第一个也不会使用（latent_state取最后一个attn）
             attn_output = torch.cat([attn_output, torch.zeros_like(attn_output[-1:])], dim=0)
