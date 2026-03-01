@@ -439,12 +439,15 @@ class PlayerDV3(nn.Module):
             attn_output = self.world_model.get_initial_states([1, num_envs])
         else:
             fake_action = torch.zeros_like(self.seq_action[-1:])
-            seq_action = torch.cat([self.seq_action, fake_action], dim=0)[-seq_len:] # 可能shift，shift后位置就一致了
+            # 添加后可能发生截取，与 self.seq_is_first 保持一致
+            seq_action_with_fake = torch.cat([self.seq_action, fake_action], dim=0)[-seq_len:]
             # keep seq len to 63
-            attn_output = self.world_model._attn_output(stochastic_state[:-1], seq_action[:-1], self.seq_is_first[:-1])
-            # shift掉最后一个fake attn，shift补进去的第一个也不会使用（latent_state取最后一个attn）
-            attn_output = torch.cat([attn_output, torch.zeros_like(attn_output[-1:])], dim=0)
-            attn_output = self.world_model._shift_and_mask(attn_output, self.seq_is_first)
+            attn_output = self.world_model._attn_output(stochastic_state[:-1], seq_action_with_fake[:-1], self.seq_is_first[:-1])
+
+        is_first_mask = self.seq_is_first[1:].squeeze(-1).bool()
+        if is_first_mask.any():
+            initial_state = self.world_model.get_initial_states([])
+            attn_output[is_first_mask] = initial_state
 
         latent_state = self.world_model.latent(stochastic_state[-1:], attn_output[-1:])
 
