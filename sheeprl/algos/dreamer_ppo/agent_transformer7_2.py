@@ -438,11 +438,7 @@ class PlayerDV3(nn.Module):
         if self.seq_action.shape[0] == 0:
             attn_output = self.world_model.get_initial_states([1, num_envs])
         else:
-            fake_action = torch.zeros_like(self.seq_action[-1:])
-            # 添加后可能发生截取，与 self.seq_is_first 保持一致
-            seq_action_with_fake = torch.cat([self.seq_action, fake_action], dim=0)[-seq_len:]
-            # keep seq len to 63
-            attn_output = self.world_model._attn_output(stochastic_state[:-1], seq_action_with_fake[:-1], self.seq_is_first[:-1])
+            attn_output = self.world_model._attn_output(stochastic_state[:-1], self.seq_action, self.seq_is_first[:-1])
 
         is_first_mask = self.seq_is_first[1:].squeeze(-1).bool()
         if is_first_mask.any():
@@ -452,7 +448,7 @@ class PlayerDV3(nn.Module):
         latent_state = self.world_model.latent(stochastic_state[-1:], attn_output[-1:])
 
         actions, _ = self.actor(latent_state[-1:], greedy, mask)
-        self.seq_action = torch.cat([self.seq_action, torch.cat(actions, dim=-1)], dim=0)[-seq_len:]
+        self.seq_action = torch.cat([self.seq_action, torch.cat(actions, dim=-1)], dim=0)[-(seq_len-1):]
         return actions
 
 
