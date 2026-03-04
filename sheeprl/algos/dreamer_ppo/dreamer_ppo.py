@@ -11,7 +11,6 @@ import torch
 import torch.nn.functional as F
 from lightning import Fabric
 import gymnasium as gym
-from torch import nn
 from torchmetrics import SumMetric
 
 import sheeprl.algos.dreamer_ppo.agent_dreamerv3
@@ -26,6 +25,7 @@ import sheeprl.algos.dreamer_ppo.agent_transformer7
 import sheeprl.algos.dreamer_ppo.agent_transformer7_1
 import sheeprl.algos.dreamer_ppo.agent_transformer7_2
 import sheeprl.algos.dreamer_ppo.agent_transformer7_3
+import sheeprl.algos.dreamer_ppo.agent_transformer7_4
 import sheeprl.algos.dreamer_ppo.agent_transformer8
 import sheeprl.algos.dreamer_ppo.agent_transformer9
 import sheeprl.algos.dreamer_ppo.agent_transformer10
@@ -40,19 +40,9 @@ from sheeprl.utils.timer import timer
 from sheeprl.utils.utils import save_configs, Ratio
 
 
-F_BUILD_AGENT = sheeprl.algos.dreamer_ppo.agent_transformer7_3.build_agent
-F_TRAIN = sheeprl.algos.dreamer_ppo.agent_transformer7_3.train
+F_BUILD_AGENT = sheeprl.algos.dreamer_ppo.agent_transformer7_4.build_agent
+F_TRAIN = sheeprl.algos.dreamer_ppo.agent_transformer7_4.train
 SAMPLE_NEXT_OBS = False
-
-
-class Model(nn.Module):
-    def __init__(self, world_model: nn.Module, actor: nn.Module, critic: nn.Module, target_critic: nn.Module):
-        super().__init__()
-        self.world_model = world_model
-        self.actor = actor
-        self.critic = critic
-        self.target_critic = target_critic
-
 
 @register_algorithm()
 def main(fabric: Fabric, cfg: Dict[str, Any]):
@@ -116,13 +106,11 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
         cfg,
         observation_space,
     )
-    model = Model(world_model, actor, critic, target_critic)
-    model.to(device=device, dtype=torch.float32)
-    # world_model = world_model.to(device=device, dtype=torch.float32)
-    # actor = actor.to(device=device, dtype=torch.float32)
-    # critic = critic.to(device=device, dtype=torch.float32)
-    # if target_critic is not None:
-    #     target_critic = target_critic.to(device=device, dtype=torch.float32)
+    world_model = world_model.to(device=device, dtype=torch.float32)
+    actor = actor.to(device=device, dtype=torch.float32)
+    critic = critic.to(device=device, dtype=torch.float32)
+    if target_critic is not None:
+        target_critic = target_critic.to(device=device, dtype=torch.float32)
     # player = player.to(device=device)
     # tie_player_weights(player, world_model, actor)
 
@@ -216,7 +204,6 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
         policy_step += policy_steps_per_iter
 
         with torch.inference_mode():
-            model.eval()
             # Measure environment interaction time: this considers both the model forward
             # to get the action given the observation and the time taken into the environment
             with timer("Time/env_interaction_time", SumMetric, sync_on_compute=False):
@@ -324,7 +311,6 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                 player.init_states(dones_idxes)
 
         # Train the agent
-        model.train()
         if iter_num >= learning_starts:
             ratio_steps = policy_step - prefill_steps * policy_steps_per_iter
             per_rank_gradient_steps = ratio(ratio_steps)

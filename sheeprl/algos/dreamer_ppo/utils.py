@@ -27,6 +27,13 @@ MODELS_TO_REGISTER = {"world_model", "actor", "critic"}
 def choose_latent_state(logits: Tensor, stochastic_state: Tensor) -> Tensor:
     return stochastic_state.view(*stochastic_state.shape[:-2], -1)
 
+def generate_single_query_attention_mask(is_first_seq: Tensor) -> Tensor:
+    episode_ids = torch.cumsum(is_first_seq, dim=-1)  # Shape: [batch_size, seq_len]
+    episode_id_for_key = episode_ids.unsqueeze(-2)  # Shape: [batch_size, 1, seq_len]
+    episode_ids_last = episode_ids[:, -1:].unsqueeze(1)  # Shape: [batch_size, 1, 1]
+    key_padding_mask = episode_ids_last > episode_id_for_key  # True means mask out
+    return key_padding_mask
+
 def generate_attention_mask(is_first_seq: Tensor) -> Tuple[Tensor, Tensor]:
     """
     Generates attention masks for gym game sequences with episode resets indicated by 1s.
@@ -56,11 +63,6 @@ def generate_attention_mask(is_first_seq: Tensor) -> Tuple[Tensor, Tensor]:
     episode_ids = torch.cumsum(is_first_seq, dim=-1)  # Shape: [batch_size, seq_len]
 
     # Step 2: Create index grids for queries and keys
-    # query_idx: [batch_size, seq_len, 1]
-    query_idx = torch.arange(seq_len, device=device).view(1, -1, 1).expand(batch_size, -1, -1)
-    # key_idx: [batch_size, 1, seq_len]
-    key_idx = torch.arange(seq_len, device=device).view(1, 1, -1).expand(batch_size, -1, -1)
-
     # episode_id_for_query: [batch_size, seq_len, 1]
     episode_id_for_query = episode_ids.unsqueeze(-1)  # Shape: [batch_size, seq_len, 1]
     # episode_id_for_key: [batch_size, 1, seq_len]
@@ -252,3 +254,101 @@ if __name__ == "__main__":
     print("Lower triangle mask test (non-square, truncated) passed!")
     
     print("\n=== All tests passed! ===")
+
+    # ============================================================
+    # Test generate_single_query_attention_mask
+    # ============================================================
+    print("\n--- Testing generate_single_query_attention_mask ---")
+    
+    # Test case 1: Original is_first tensor
+    _, key_padding_mask = generate_attention_mask(is_first)
+    single_query_mask = generate_single_query_attention_mask(is_first)
+    
+    # The single query mask should match the last query row of key_padding_mask
+    expected_mask = key_padding_mask[:, -1:, :]
+    
+    print(f"single_query_mask shape: {single_query_mask.shape}")
+    print(f"expected_mask shape: {expected_mask.shape}")
+    print(f"single_query_mask:\n{single_query_mask}")
+    print(f"expected_mask:\n{expected_mask}")
+    
+    assert single_query_mask.shape == expected_mask.shape, \
+        f"Shape mismatch: {single_query_mask.shape} vs {expected_mask.shape}"
+    assert (single_query_mask == expected_mask).all(), \
+        "single_query_mask does not match the last row of key_padding_mask"
+    print("Test case 1 passed!")
+    
+    # Test case 2: Various edge cases
+    print("\n--- Testing generate_single_query_attention_mask with edge cases ---")
+    
+    # Edge case 1: All zeros (no episode boundaries)
+    is_first_all_zeros = torch.tensor([
+        [0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0],
+    ])
+    _, kpm_all_zeros = generate_attention_mask(is_first_all_zeros)
+    sqm_all_zeros = generate_single_query_attention_mask(is_first_all_zeros)
+    assert (sqm_all_zeros == kpm_all_zeros[:, -1:, :]).all(), \
+        "Failed for all zeros case"
+    print("Edge case 1 (all zeros) passed!")
+    
+    # Edge case 2: All ones (every position is a new episode)
+    is_first_all_ones = torch.tensor([
+        [1, 1, 1, 1, 1],
+        [1, 1, 1, 1, 1],
+    ])
+    _, kpm_all_ones = generate_attention_mask(is_first_all_ones)
+    sqm_all_ones = generate_single_query_attention_mask(is_first_all_ones)
+    assert (sqm_all_ones == kpm_all_ones[:, -1:, :]).all(), \
+        "Failed for all ones case"
+    print("Edge case 2 (all ones) passed!")
+    
+    # Edge case 3: Single element sequence
+    is_first_single = torch.tensor([
+        [0],
+        [1],
+        [0],
+    ])
+    _, kpm_single = generate_attention_mask(is_first_single)
+    sqm_single = generate_single_query_attention_mask(is_first_single)
+    assert (sqm_single == kpm_single[:, -1:, :]).all(), \
+        "Failed for single element case"
+    print("Edge case 3 (single element) passed!")
+    
+    # Edge case 4: Long sequence with multiple episode boundaries
+    is_first_long = torch.tensor([
+        [0, 0, 1, 0, 0, 1, 0, 0, 0, 1],
+        [1, 0, 0, 0, 1, 0, 0, 1, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    ])
+    _, kpm_long = generate_attention_mask(is_first_long)
+    sqm_long = generate_single_query_attention_mask(is_first_long)
+    assert (sqm_long == kpm_long[:, -1:, :]).all(), \
+        "Failed for long sequence case"
+    print("Edge case 4 (long sequence) passed!")
+    
+    # Edge case 5: Episode boundary at the last position
+    is_first_last = torch.tensor([
+        [0, 0, 0, 0, 1],
+        [0, 0, 0, 0, 0],
+    ])
+    _, kpm_last = generate_attention_mask(is_first_last)
+    sqm_last = generate_single_query_attention_mask(is_first_last)
+    assert (sqm_last == kpm_last[:, -1:, :]).all(), \
+        "Failed for episode boundary at last position"
+    print("Edge case 5 (episode at last position) passed!")
+    
+    # Edge case 6: Random test with multiple runs
+    print("\n--- Testing generate_single_query_attention_mask with random inputs ---")
+    torch.manual_seed(42)
+    for trial in range(10):
+        batch_size = torch.randint(1, 5, (1,)).item()
+        seq_len = torch.randint(1, 20, (1,)).item()
+        is_first_random = torch.randint(0, 2, (batch_size, seq_len))
+        _, kpm_random = generate_attention_mask(is_first_random)
+        sqm_random = generate_single_query_attention_mask(is_first_random)
+        assert (sqm_random == kpm_random[:, -1:, :]).all(), \
+            f"Failed for random test trial {trial}: batch_size={batch_size}, seq_len={seq_len}"
+    print(f"All {trial + 1} random tests passed!")
+    
+    print("\n=== All generate_single_query_attention_mask tests passed! ===")
