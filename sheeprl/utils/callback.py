@@ -36,7 +36,7 @@ class CheckpointCallback:
     ):
         if replay_buffer is not None:
             rb_state = self._ckpt_rb(replay_buffer)
-            state["rb"] = replay_buffer
+            state["rb"] = replay_buffer.state_dict()
             if fabric.world_size > 1:
                 # We need to collect the buffers from all the ranks
                 # The collective it is needed because the `gather_object` function is not implemented in Fabric
@@ -45,10 +45,10 @@ class CheckpointCallback:
                 checkpoint_collective.create_group(backend="gloo", ranks=list(range(fabric.world_size)))
                 gathered_rb = [None for _ in range(fabric.world_size)]
                 if fabric.global_rank == 0:
-                    checkpoint_collective.gather_object(replay_buffer, gathered_rb)
+                    checkpoint_collective.gather_object(state["rb"], gathered_rb)
                     state["rb"] = gathered_rb
                 else:
-                    checkpoint_collective.gather_object(replay_buffer, None)
+                    checkpoint_collective.gather_object(state["rb"], None)
         fabric.save(ckpt_path, state)
         if replay_buffer is not None:
             self._experiment_consistent_rb(replay_buffer, rb_state)
@@ -68,7 +68,7 @@ class CheckpointCallback:
         state = state[0]
         if replay_buffer is not None:
             rb_state = self._ckpt_rb(replay_buffer)
-            state["rb"] = replay_buffer
+            state["rb"] = replay_buffer.state_dict()
         if ratio_state_dict is not None:
             state["ratio"] = ratio_state_dict
         fabric.save(ckpt_path, state)

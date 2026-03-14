@@ -7,6 +7,7 @@ defaults:
   - _self_
 
 exp_name: ${algo.name}_${env.id}
+#run_name: 2026-03-14_15-33-03_dreamer_ppo_PongNoFrameskip-v4_42
 
 # Algorithm
 algo:
@@ -40,11 +41,12 @@ algo:
 # Checkpoint
 checkpoint:
   every: 100000
+#  resume_from: 'logs/runs/dreamer_ppo/PongNoFrameskip-v4/2026-03-14_15-33-03_dreamer_ppo_PongNoFrameskip-v4_42/version_3/checkpoint/ckpt_6_0.ckpt'
 
 # Buffer
 buffer:
   size: 1000000
-  checkpoint: False
+  checkpoint: True
 
 env:
   capture_video_episodes: 10

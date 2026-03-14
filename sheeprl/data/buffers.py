@@ -360,6 +360,96 @@ class ReplayBuffer:
                 value_to_add = np.copy(value.array)
         self.buffer.update({key: value_to_add})
 
+    def state_dict(self) -> Dict:
+        """Return a serialisable snapshot of the buffer metadata.
+
+        The actual memmap / numpy data is **not** copied into the dict – it lives
+        on disk (memmap) or is referenced in-memory.  Only bookkeeping fields
+        needed to restore the buffer position and re-associate with existing
+        memmap files are included.
+        """
+        buf_meta = {}
+        for k, v in self._buf.items():
+            if isinstance(v, MemmapArray):
+                buf_meta[k] = {
+                    "type": "memmap",
+                    "filename": str(v.filename),
+                    "dtype": str(v.dtype),
+                    "shape": v.shape,
+                    "mode": v.mode,
+                }
+            else:
+                buf_meta[k] = {
+                    "type": "numpy",
+                    "dtype": str(v.dtype),
+                    "shape": v.shape,
+                }
+        return {
+            "pos": self._pos,
+            "full": self._full,
+            "buffer_size": self._buffer_size,
+            "n_envs": self._n_envs,
+            "obs_keys": list(self._obs_keys),
+            "memmap": self._memmap,
+            "memmap_mode": self._memmap_mode,
+            "buf_meta": buf_meta,
+        }
+
+    def load_state_dict(
+        self,
+        state: Dict,
+        memmap_dir: str | os.PathLike | None = None,
+    ) -> None:
+        """Restore buffer metadata from *state* and re-associate memmap files.
+
+        Args:
+            state: dict produced by :meth:`state_dict`.
+            memmap_dir: if given, **remap** every MemmapArray filename so that it
+                points to ``memmap_dir / <original-basename>`` instead of the
+                path stored in the checkpoint.  This is the key mechanism that
+                lets a resumed run pick up the memmap files living inside the
+                *current* log directory while the checkpoint was saved with a
+                (potentially different) absolute path.
+        """
+        self._pos = state["pos"]
+        self._full = state["full"]
+
+        if memmap_dir is not None:
+            memmap_dir = Path(memmap_dir)
+            memmap_dir.mkdir(parents=True, exist_ok=True)
+
+        for k, meta in state["buf_meta"].items():
+            if meta["type"] == "memmap":
+                old_filename = Path(meta["filename"])
+                if memmap_dir is not None:
+                    new_filename = memmap_dir / old_filename.name
+                else:
+                    new_filename = old_filename
+
+                # If the file already exists at the target location, open it
+                # directly so that existing data is preserved.
+                if os.path.isfile(new_filename):
+                    self._buf[k] = MemmapArray(
+                        filename=new_filename,
+                        dtype=np.dtype(meta["dtype"]),
+                        shape=meta["shape"],
+                        mode=meta["mode"],
+                    )
+                else:
+                    # Create a fresh memmap file.  The buffer will start empty
+                    # at the saved _pos – subsequent add() calls will fill it.
+                    self._buf[k] = MemmapArray(
+                        filename=new_filename,
+                        dtype=np.dtype(meta["dtype"]),
+                        shape=meta["shape"],
+                        mode=meta["mode"],
+                    )
+            else:
+                self._buf[k] = np.empty(
+                    shape=meta["shape"],
+                    dtype=np.dtype(meta["dtype"]),
+                )
+
 
 class SequentialReplayBuffer(ReplayBuffer):
     batch_axis: int = 2
@@ -742,6 +832,45 @@ class EnvIndependentReplayBuffer:
         return {
             k: get_tensor(v, dtype=dtype, clone=clone, device=device, from_numpy=from_numpy) for k, v in samples.items()
         }
+
+    def state_dict(self) -> Dict:
+        """Return a serialisable snapshot of every sub-buffer.
+
+        Each entry is the per-sub-buffer ``state_dict()`` produced by
+        :meth:`ReplayBuffer.state_dict`.
+        """
+        return {
+            "buffer_size": self._buffer_size,
+            "n_envs": self._n_envs,
+            "buffers": [b.state_dict() for b in self._buf],
+        }
+
+    def load_state_dict(
+        self,
+        state: Dict,
+        memmap_dir: str | os.PathLike | None = None,
+    ) -> None:
+        """Restore all sub-buffers from *state*.
+
+        Args:
+            state: dict produced by :meth:`state_dict`.
+            memmap_dir: if given, remap each sub-buffer's MemmapArray filenames
+                so they point under *memmap_dir* instead of the original
+                absolute paths stored in the checkpoint.  Sub-directories
+                ``env_0/``, ``env_1/``, … are created automatically to match
+                the layout produced by :meth:`__init__`.
+        """
+        buffer_states = state["buffers"]
+        if len(buffer_states) != len(self._buf):
+            raise ValueError(
+                f"State has {len(buffer_states)} sub-buffers but the current buffer "
+                f"has {len(self._buf)}.  The number of environments must match."
+            )
+        for i, (sub_buf, sub_state) in enumerate(zip(self._buf, buffer_states)):
+            sub_memmap_dir = None
+            if memmap_dir is not None:
+                sub_memmap_dir = Path(memmap_dir) / f"env_{i}"
+            sub_buf.load_state_dict(sub_state, memmap_dir=sub_memmap_dir)
 
 
 class EpisodeBuffer:

@@ -42,8 +42,8 @@ from sheeprl.utils.timer import timer
 from sheeprl.utils.utils import save_configs, Ratio
 
 
-F_BUILD_AGENT = sheeprl.algos.dreamer_ppo.agent_transformer7_6.build_agent
-F_TRAIN = sheeprl.algos.dreamer_ppo.agent_transformer7_6.train
+F_BUILD_AGENT = sheeprl.algos.dreamer_ppo.agent_transformer7_3.build_agent
+F_TRAIN = sheeprl.algos.dreamer_ppo.agent_transformer7_3.train
 SAMPLE_NEXT_OBS = False
 
 @register_algorithm()
@@ -164,7 +164,13 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
         buffer_cls=SequentialReplayBuffer,
     )
     if cfg.checkpoint.resume_from and cfg.buffer.checkpoint:
-        rb = state["rb"]
+        if isinstance(state["rb"], dict):
+            ckpt_dir = os.path.dirname(os.path.dirname(cfg.checkpoint.resume_from))
+            # New format: state_dict-based restore with memmap_dir remapping
+            rb.load_state_dict(
+                state["rb"],
+                memmap_dir=os.path.join(ckpt_dir, "memmap_buffer", f"rank_{fabric.global_rank}"),
+            )
 
     # Global variables
     start_iter = state["iter_num"] + 1 if cfg.checkpoint.resume_from else 1

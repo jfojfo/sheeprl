@@ -123,6 +123,8 @@ class MemmapArray(np.lib.mixins.NDArrayOperatorsMixin):
                 shape=self._shape,
                 mode=self._mode,
             )
+            self._array_dir = self._array.__dir__()
+            self.__array_interface__ = self._array.__array_interface__
         return self._array
 
     @array.setter
@@ -251,11 +253,23 @@ class MemmapArray(np.lib.mixins.NDArrayOperatorsMixin):
     def __setstate__(self, state):
         filename = state["_filename"]
         if state["_file"] is None:
-            tmpfile = _TemporaryFileWrapper(None, filename, delete=True)
+            tmpfile = _TemporaryFileWrapper(None, filename, delete=False)
             tmpfile.name = filename
             tmpfile._closer.name = filename
             state["_file"] = tmpfile
+        state["_has_ownership"] = False
+        state["_array"] = None
         self.__dict__.update(state)
+        # Reinitialize _array_dir and __array_interface__ so that __getattr__
+        # and numpy interop work correctly before the first array access.
+        if filename is not None and os.path.isfile(filename):
+            _tmp = np.memmap(filename=filename, dtype=state["_dtype"], shape=state["_shape"], mode=state["_mode"])
+            self._array_dir = _tmp.__dir__()
+            self.__array_interface__ = _tmp.__array_interface__
+            del _tmp
+        else:
+            self._array_dir = []
+            self.__array_interface__ = {}
 
     def __getitem__(self, idx: Any) -> np.ndarray:
         return self.array[idx]
