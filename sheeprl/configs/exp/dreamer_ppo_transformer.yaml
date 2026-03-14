@@ -24,6 +24,13 @@ algo:
     decoder: [rgb]
   dense_units: 128
 
+  cnn_layer_norm:
+    kw:
+      eps: 1e-5
+  mlp_layer_norm:
+    kw:
+      eps: 1e-5
+
   world_model:
     discrete_size: 32
     stochastic_size: 32

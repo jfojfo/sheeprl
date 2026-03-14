@@ -28,7 +28,7 @@ class ReverseRoPEPosition(nn.Module):
     def __init__(self, dim, max_seq_len=512):
         super().__init__()
         base = max_seq_len * 10
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         t = torch.arange(max_seq_len).type_as(inv_freq)
         freqs = torch.outer(t, inv_freq)
         # freqs_cis: complex - (seq_len, head_dim / 2)
@@ -118,6 +118,9 @@ class MySelfAttention(nn.Module):
         attn_weights = torch.bmm(q_rope, k_rope.transpose(-2, -1)) / (self.head_dim ** 0.5)
 
         if attn_mask is not None:
+            # a a a, b b b, c c c
+            # attn_mask = attn_mask.repeat_interleave(repeats=self.num_heads, dim=0)
+            attn_mask = attn_mask.unsqueeze(1).expand(-1, self.num_heads, -1, -1).reshape(-1, *attn_mask.shape[-2:])
             if attn_mask.dtype == torch.bool:
                 attn_mask = attn_mask.float().masked_fill(attn_mask, float("-inf"))
             attn_weights += attn_mask
@@ -375,10 +378,6 @@ class WorldModel(nn.Module):
 
         embed_seq = torch.cat([self.embed_state(posterior), self.embed_action(actions)], dim=-1)
         attn_mask, _ = generate_attention_mask(is_first.squeeze(-1).transpose(0, 1))
-        num_heads = self.cfg.algo.world_model.transformer.num_heads
-        # a a a, b b b, c c c
-        attn_mask = attn_mask.unsqueeze(1).expand(-1, num_heads, -1, -1).reshape(-1, *attn_mask.shape[-2:])
-        # attn_mask = attn_mask.repeat_interleave(repeats=self.cfg.algo.world_model.transformer.num_heads, dim=0)
         attn_output, _, _ = self.transformer(embed_seq, embed_seq, attn_mask=attn_mask)
         return attn_output
 
@@ -664,8 +663,6 @@ def train(
 
 
     # Behaviour Learning
-    world_model.eval()
-
     latent_states_size = latent_states.shape[-1]
     new_batch_size = np.prod(latent_states.shape[:2])
     imagined_trajectories = torch.empty(
@@ -704,9 +701,8 @@ def train(
     )
     # Imagine trajectories in the latent space
     for i in range(1, cfg.algo.horizon + 1):
-        with torch.inference_mode():
-            imagined_logits, imagined_stochastic_state, imagined_attn_output, kv_cache = world_model.imagination(
-                imagined_stochastic_state, actions, kv_cache)
+        imagined_logits, imagined_stochastic_state, imagined_attn_output, kv_cache = world_model.imagination(
+            imagined_stochastic_state, actions, kv_cache)
         imagined_latent_state = world_model.latent(imagined_stochastic_state, imagined_attn_output)
         imagined_trajectories[i] = imagined_latent_state
         actions = torch.cat(actor(imagined_latent_state.detach())[0], dim=-1)
@@ -721,12 +717,9 @@ def train(
     predicted_values = dist_critic_cls(imagined_critic_values, dims=1).mean
 
     dist_rewards_cls = MSEDistribution if cfg.algo.world_model.reward_model.bins == 1 else TwoHotEncodingDistribution
-    with torch.inference_mode():
-        predicted_rewards = dist_rewards_cls(world_model.reward_model(imagined_trajectories), dims=1).mean
+    predicted_rewards = dist_rewards_cls(world_model.reward_model(imagined_trajectories), dims=1).mean
 
-    with torch.inference_mode():
-        continues = Independent(BernoulliSafeMode(logits=world_model.continue_model(imagined_trajectories)), 1).mode
-
+    continues = Independent(BernoulliSafeMode(logits=world_model.continue_model(imagined_trajectories)), 1).mode
     true_continue = (1 - data["terminated"]).flatten().reshape(1, -1, 1)
     continues = torch.cat((true_continue, continues[1:]))
 

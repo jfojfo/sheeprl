@@ -108,9 +108,9 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
         cfg,
         observation_space,
     )
-    world_model = world_model.to(device=device, dtype=torch.float32)
-    actor = actor.to(device=device, dtype=torch.float32)
-    critic = critic.to(device=device, dtype=torch.float32)
+    world_model = world_model.to(device=device)
+    actor = actor.to(device=device)
+    critic = critic.to(device=device)
     if target_critic is not None:
         target_critic = target_critic.to(device=device, dtype=torch.float32)
     # player = player.to(device=device)
@@ -197,10 +197,10 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
     obs_keys = cfg.algo.cnn_keys.encoder
     for k in obs_keys:
         step_data[k] = obs[k][np.newaxis]
-    step_data["rewards"] = np.zeros((1, cfg.env.num_envs, 1))
-    step_data["truncated"] = np.zeros((1, cfg.env.num_envs, 1))
-    step_data["terminated"] = np.zeros((1, cfg.env.num_envs, 1))
-    step_data["is_first"] = np.ones_like(step_data["terminated"])
+    step_data["rewards"] = np.zeros((1, cfg.env.num_envs, 1), dtype=np.float32)
+    step_data["truncated"] = np.zeros((1, cfg.env.num_envs, 1), dtype=np.bool_)
+    step_data["terminated"] = np.zeros((1, cfg.env.num_envs, 1), dtype=np.bool_)
+    step_data["is_first"] = np.ones_like(step_data["terminated"], dtype=np.bool_)
     player.init_states()
 
     seq_len = cfg.algo.per_rank_sequence_length
@@ -245,7 +245,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                             torch.stack([real_act.argmax(dim=-1) for real_act in real_actions], dim=-1).cpu().numpy()
                         )
 
-                step_data["actions"] = actions.reshape((1, cfg.env.num_envs, -1))
+                step_data["actions"] = actions.reshape((1, cfg.env.num_envs, -1)).astype(np.float32)
                 rb.add(step_data, validate_args=cfg.buffer.validate_args)
 
                 next_obs, rewards, terminated, truncated, infos = envs.step(
@@ -293,7 +293,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
             # next_obs becomes the new obs
             obs = next_obs
 
-            rewards = rewards.reshape((1, cfg.env.num_envs, -1))
+            rewards = rewards.reshape((1, cfg.env.num_envs, -1)).astype(np.float32)
             step_data["terminated"] = terminated.reshape((1, cfg.env.num_envs, -1))
             step_data["truncated"] = truncated.reshape((1, cfg.env.num_envs, -1))
             step_data["rewards"] = clip_rewards_fn(rewards)
