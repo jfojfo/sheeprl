@@ -42,8 +42,8 @@ from sheeprl.utils.timer import timer
 from sheeprl.utils.utils import save_configs, Ratio
 
 
-F_BUILD_AGENT = sheeprl.algos.dreamer_ppo.agent_transformer7_3.build_agent
-F_TRAIN = sheeprl.algos.dreamer_ppo.agent_transformer7_3.train
+F_BUILD_AGENT = sheeprl.algos.dreamer_ppo.agent_transformer9.build_agent
+F_TRAIN = sheeprl.algos.dreamer_ppo.agent_transformer9.train
 SAMPLE_NEXT_OBS = False
 
 @register_algorithm()

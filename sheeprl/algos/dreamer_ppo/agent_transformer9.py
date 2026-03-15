@@ -27,8 +27,8 @@ from sheeprl.utils.metric import MetricAggregator
 class ReverseRoPEPosition(nn.Module):
     def __init__(self, dim, max_seq_len=512):
         super().__init__()
-
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        base = max_seq_len * 10
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         t = torch.arange(max_seq_len).type_as(inv_freq)
         freqs = torch.outer(t, inv_freq)
         # freqs_cis: complex - (seq_len, head_dim / 2)
@@ -118,6 +118,9 @@ class MySelfAttention(nn.Module):
         attn_weights = torch.bmm(q_rope, k_rope.transpose(-2, -1)) / (self.head_dim ** 0.5)
 
         if attn_mask is not None:
+            # a a a, b b b, c c c
+            # attn_mask = attn_mask.repeat_interleave(repeats=self.num_heads, dim=0)
+            attn_mask = attn_mask.unsqueeze(1).expand(-1, self.num_heads, -1, -1).reshape(-1, *attn_mask.shape[-2:])
             if attn_mask.dtype == torch.bool:
                 attn_mask = attn_mask.float().masked_fill(attn_mask, float("-inf"))
             attn_weights += attn_mask
@@ -130,7 +133,7 @@ class MySelfAttention(nn.Module):
         output = output.transpose(0, 1).contiguous()
         output = output.view(tgt_len, batch_size, self.embed_dim)
         output = self.out_proj(output)
-        return output, kv_cache
+        return output, attn_weights, kv_cache
 
 class MyTransformerEncoderLayer(nn.Module):
     def __init__(self, embed_dim, num_heads, dim_feedforward=1024, max_seq_len=512, dropout=0.1):
@@ -153,6 +156,16 @@ class MyTransformerEncoderLayer(nn.Module):
 
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(embed_dim)
+        self.init_weight()
+
+    def init_weight(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                # 对于权重矩阵，使用 Xavier Uniform
+                nn.init.xavier_uniform_(p)
+            else:
+                # 对于偏置，初始化为 0
+                nn.init.zeros_(p)
 
     def forward(self, q_input, kv_input, kv_cache=None, attn_mask=None):
         """
@@ -166,7 +179,7 @@ class MyTransformerEncoderLayer(nn.Module):
             norm_src_kv = norm_src
         else:
             norm_src_kv = self.norm1(kv_input)
-        attn_output, w = self.self_attn(norm_src, norm_src_kv, norm_src_kv,
+        attn_output, w, kv_cache = self.self_attn(norm_src, norm_src_kv, norm_src_kv,
                                         kv_cache=kv_cache,
                                         attn_mask=attn_mask)
         # src2: [src_len,batch_size,num_heads*kdim] num_heads*kdim = embed_dim
@@ -357,19 +370,24 @@ class WorldModel(nn.Module):
 
         embed_seq = torch.cat([self.embed_state(posterior), self.embed_action(actions)], dim=-1)
         attn_mask, _ = generate_attention_mask(is_first.squeeze(-1).transpose(0, 1))
-        num_heads = self.cfg.algo.world_model.transformer.num_heads
-        # a a a, b b b, c c c
-        attn_mask = attn_mask.unsqueeze(1).expand(-1, num_heads, -1, -1).reshape(-1, *attn_mask.shape[-2:])
-        # attn_mask = attn_mask.repeat_interleave(repeats=self.cfg.algo.world_model.transformer.num_heads, dim=0)
         attn_output, _, _ = self.transformer(embed_seq, embed_seq, attn_mask=attn_mask)
         return attn_output
 
+    # def _shift_and_mask(self, stochastic_state: Tensor, actions: Tensor, is_first: Tensor) -> Tensor:
+    #     initial_state = self.get_initial_states(stochastic_state.shape[:2])
+    #     stochastic_state = torch.cat((initial_state[:1], stochastic_state[:-1]), dim=0)
+    #     actions = torch.cat((torch.zeros_like(actions[:1]), actions[:-1]), dim=0)
+    #     # 对于is_first为1的位置，重置为初始状态
+    #     stochastic_state = (1 - is_first.unsqueeze(-1)) * stochastic_state + is_first.unsqueeze(-1) * initial_state
+    #     actions = (1 - is_first) * actions
+    #     return stochastic_state, actions
+
     def _shift_and_mask(self, stochastic_state: Tensor, actions: Tensor, is_first: Tensor) -> Tensor:
-        initial_state = self.get_initial_states(stochastic_state.shape[:2])
-        stochastic_state = torch.cat((initial_state[:1], stochastic_state[:-1]), dim=0)
+        continue_state = self.get_initial_states([1, stochastic_state.shape[1]])
+        stochastic_state = torch.cat((continue_state[:1], stochastic_state[:-1]), dim=0)
         actions = torch.cat((torch.zeros_like(actions[:1]), actions[:-1]), dim=0)
-        # 对于is_first为1的位置，重置为初始状态
-        stochastic_state = (1 - is_first.unsqueeze(-1)) * stochastic_state + is_first.unsqueeze(-1) * initial_state
+        # 对于is_first为1的位置，重置为zero（seq staring token）
+        stochastic_state = (1 - is_first.unsqueeze(-1)) * stochastic_state
         actions = (1 - is_first) * actions
         return stochastic_state, actions
 
@@ -386,7 +404,7 @@ class WorldModel(nn.Module):
     def imagination(self, stochastic_state: Tensor, action: Tensor, kv_cache: tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         prior = stochastic_state.view(*stochastic_state.shape[:-2], -1)
         embed = torch.cat([self.embed_state(prior), self.embed_action(action)], dim=-1)
-        attn_output, kv_cache, _ = self.transformer(embed, embed, kv_cache=kv_cache)
+        attn_output, _, kv_cache = self.transformer(embed, embed, kv_cache=kv_cache)
         logits, stochastic_state = self._transition(attn_output)
         return logits, stochastic_state, attn_output, kv_cache
 
@@ -439,9 +457,9 @@ class PlayerDV3(nn.Module):
             attn_output = self.world_model._attn_output(initial_state, action, self.seq_is_first)
         else:
             fake_action = torch.zeros_like(self.seq_action[-1:])
-            seq_action = torch.cat([self.seq_action, fake_action], dim=0)[-seq_len:]
+            seq_action_with_fake = torch.cat([self.seq_action, fake_action], dim=0)[-seq_len:]
             # shift掉最后一个fake attn，shift补进去的第一个也不会使用（latent_state取最后一个attn）
-            shifted_stochastic_state, shifted_seq_action = self.world_model._shift_and_mask(stochastic_state, seq_action, self.seq_is_first)
+            shifted_stochastic_state, shifted_seq_action = self.world_model._shift_and_mask(stochastic_state, seq_action_with_fake, self.seq_is_first)
             seq_is_first = self.seq_is_first
             # 去除shift补进去的第一个
             # shifted_stochastic_state, shifted_seq_action = shifted_stochastic_state[1:], shifted_seq_action[1:]
@@ -561,7 +579,7 @@ def train(
     device = fabric.device
     batch_obs = {k: data[k] / 255.0 - 0.5 for k in cfg.algo.cnn_keys.encoder}
     batch_obs.update({k: data[k] for k in cfg.algo.mlp_keys.encoder})
-    data["is_first"][0, :] = torch.ones_like(data["is_first"][0, :])
+    # data["is_first"][0, :] = torch.ones_like(data["is_first"][0, :])
 
     # Given how the environment interaction works, we remove the last actions
     # and add the first one as the zero action
