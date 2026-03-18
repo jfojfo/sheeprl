@@ -355,8 +355,8 @@ class WorldModel(nn.Module):
     def dynamic(self, embedded_obs: Tensor, actions: Tensor, is_first: Tensor) \
             -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         posterior_logits, posterior_stochastic_state = self._representation(embedded_obs)
-        posterior_stochastic_state, actions = self._shift_and_mask(posterior_stochastic_state, actions, is_first)
-        attn_output = self._attn_output(posterior_stochastic_state, actions, is_first)
+        shifted_stochastic_state, shifted_actions = self._shift_and_mask(posterior_stochastic_state, actions, is_first)
+        attn_output = self._attn_output(shifted_stochastic_state, shifted_actions, is_first)
         prior_logits, prior_stochastic_state = self._transition(attn_output)
         return posterior_logits, posterior_stochastic_state, prior_logits, prior_stochastic_state, attn_output
 
