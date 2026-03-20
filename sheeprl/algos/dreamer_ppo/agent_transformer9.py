@@ -355,8 +355,7 @@ class WorldModel(nn.Module):
     def dynamic(self, embedded_obs: Tensor, actions: Tensor, is_first: Tensor) \
             -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         posterior_logits, posterior_stochastic_state = self._representation(embedded_obs)
-        shifted_stochastic_state, shifted_actions = self._shift_and_mask(posterior_stochastic_state, actions, is_first)
-        attn_output = self._attn_output(shifted_stochastic_state, shifted_actions, is_first)
+        attn_output, _ = self.shifted_attn(posterior_stochastic_state, actions, is_first)
         prior_logits, prior_stochastic_state = self._transition(attn_output)
         return posterior_logits, posterior_stochastic_state, prior_logits, prior_stochastic_state, attn_output
 
@@ -365,21 +364,28 @@ class WorldModel(nn.Module):
         latent_state = torch.cat([posterior, attn_output], dim=-1)
         return latent_state
 
-    def _attn_output(self, stochastic_state: Tensor, actions: Tensor, is_first: Tensor) -> Tensor:
+    def shifted_attn(self, stochastic_state: Tensor, actions: Tensor, is_first: Tensor = None, kv_cache: tuple[Tensor, Tensor] = None) -> [Tensor, Tensor]:
+        shifted_stochastic_state, shifted_actions = self._shift_and_mask(stochastic_state, actions, is_first)
+        attn_output, kv_cache = self._attn_output(shifted_stochastic_state, shifted_actions, is_first, kv_cache)
+        return attn_output, kv_cache
+
+    def _attn_output(self, stochastic_state: Tensor, actions: Tensor, is_first: Tensor = None, kv_cache: tuple[Tensor, Tensor] = None) -> [Tensor, Tensor]:
         posterior = stochastic_state.view(*stochastic_state.shape[:-2], -1)
-
         embed_seq = torch.cat([self.embed_state(posterior), self.embed_action(actions)], dim=-1)
-        attn_mask, _ = generate_attention_mask(is_first.squeeze(-1).transpose(0, 1))
-        attn_output, _, _ = self.transformer(embed_seq, embed_seq, attn_mask=attn_mask)
-        return attn_output
+        attn_mask = None
+        if is_first is not None:
+            attn_mask, _ = generate_attention_mask(is_first.squeeze(-1).transpose(0, 1))
+        attn_output, _, kv_cache = self.transformer(embed_seq, embed_seq, attn_mask=attn_mask, kv_cache=kv_cache)
+        return attn_output, kv_cache
 
-    def _shift_and_mask(self, stochastic_state: Tensor, actions: Tensor, is_first: Tensor) -> Tensor:
+    def _shift_and_mask(self, stochastic_state: Tensor, actions: Tensor, is_first: Tensor = None) -> Tensor:
         initial_state = self.get_initial_states(stochastic_state.shape[:2])
         stochastic_state = torch.cat((torch.zeros_like(stochastic_state[:1]), stochastic_state[:-1]), dim=0)
         actions = torch.cat((torch.zeros_like(actions[:1]), actions[:-1]), dim=0)
-        # 对于is_first为1的位置，重置为初始状态
-        stochastic_state = (1 - is_first.unsqueeze(-1)) * stochastic_state + is_first.unsqueeze(-1) * initial_state
-        actions = (1 - is_first) * actions
+        if is_first is not None:
+            # 对于is_first为1的位置，重置为初始状态
+            stochastic_state = (1 - is_first.unsqueeze(-1)) * stochastic_state + is_first.unsqueeze(-1) * initial_state
+            actions = (1 - is_first) * actions
         return stochastic_state, actions
 
     # def _shift_and_mask(self, stochastic_state: Tensor, actions: Tensor, is_first: Tensor) -> Tensor:
@@ -402,9 +408,8 @@ class WorldModel(nn.Module):
         return next_logits, compute_stochastic_state(next_logits, discrete=self.discrete_size)
 
     def imagination(self, stochastic_state: Tensor, action: Tensor, kv_cache: tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        prior = stochastic_state.view(*stochastic_state.shape[:-2], -1)
-        embed = torch.cat([self.embed_state(prior), self.embed_action(action)], dim=-1)
-        attn_output, _, kv_cache = self.transformer(embed, embed, kv_cache=kv_cache)
+        # no shift
+        attn_output, kv_cache = self._attn_output(stochastic_state, action, kv_cache=kv_cache)
         logits, stochastic_state = self._transition(attn_output)
         return logits, stochastic_state, attn_output, kv_cache
 
@@ -454,17 +459,11 @@ class PlayerDV3(nn.Module):
         if self.seq_action.shape[0] == 0:
             initial_state = self.world_model.get_initial_states([1, num_envs])
             action = torch.zeros((1, num_envs, sum(self.actions_dim)), dtype=torch.float32).to(self.device)
-            attn_output = self.world_model._attn_output(initial_state, action, self.seq_is_first)
+            attn_output, _ = self.world_model._attn_output(initial_state, action, self.seq_is_first)
         else:
             fake_action = torch.zeros_like(self.seq_action[-1:])
             seq_action_with_fake = torch.cat([self.seq_action, fake_action], dim=0)[-seq_len:]
-            # shift掉最后一个fake attn，shift补进去的第一个也不会使用（latent_state取最后一个attn）
-            shifted_stochastic_state, shifted_seq_action = self.world_model._shift_and_mask(stochastic_state, seq_action_with_fake, self.seq_is_first)
-            seq_is_first = self.seq_is_first
-            # 去除shift补进去的第一个
-            # shifted_stochastic_state, shifted_seq_action = shifted_stochastic_state[1:], shifted_seq_action[1:]
-            # seq_is_first = self.seq_is_first[1:]
-            attn_output = self.world_model._attn_output(shifted_stochastic_state, shifted_seq_action, seq_is_first)
+            attn_output, _ = self.world_model.shifted_attn(stochastic_state, seq_action_with_fake, self.seq_is_first)
 
         latent_state = self.world_model.latent(stochastic_state[-1:], attn_output[-1:])
 
@@ -688,6 +687,9 @@ def train(
         torch.empty(0, new_batch_size, cfg.algo.world_model.transformer.embed_dim).to(device),
         torch.empty(0, new_batch_size, cfg.algo.world_model.transformer.embed_dim).to(device),
     )
+    # update kv_cache with starting token
+    _, kv_cache = world_model.shifted_attn(imagined_stochastic_state, actions, kv_cache=kv_cache)
+
     # Imagine trajectories in the latent space
     for i in range(1, cfg.algo.horizon + 1):
         imagined_logits, imagined_stochastic_state, imagined_attn_output, kv_cache = world_model.imagination(
