@@ -357,14 +357,7 @@ class WorldModel(nn.Module):
             -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         posterior_logits, posterior_stochastic_state = self._representation(embedded_obs)
         attn_output = self._attn_output(posterior_stochastic_state, actions, is_first)
-
-        attn_output = torch.cat((torch.zeros_like(attn_output[:1]), attn_output[:-1]), dim=0)
-        # 对于is_first为1的位置，重置attn_output为初始状态
-        is_first_mask = is_first.squeeze(-1).bool()
-        if is_first_mask.any():
-            initial_state = self.get_initial_states([])
-            attn_output[is_first_mask] = initial_state
-
+        attn_output = self._shift_and_mask(attn_output, is_first)
         prior_logits, prior_stochastic_state = self._transition(attn_output)
         return posterior_logits, posterior_stochastic_state, prior_logits, prior_stochastic_state, attn_output
 
@@ -379,6 +372,16 @@ class WorldModel(nn.Module):
         embed_seq = torch.cat([self.embed_state(posterior), self.embed_action(actions)], dim=-1)
         attn_mask, _ = generate_attention_mask(is_first.squeeze(-1).transpose(0, 1))
         attn_output, _, _ = self.transformer(embed_seq, embed_seq, attn_mask=attn_mask)
+        return attn_output
+
+    def _shift_and_mask(self, attn_output: Tensor, is_first: Tensor) -> Tensor:
+        # 右移1位可与posterior对齐
+        attn_output = torch.cat((torch.zeros_like(attn_output[:1]), attn_output[:-1]), dim=0)
+        # 对于is_first为1的位置，重置attn_output为初始状态
+        is_first_mask = is_first.squeeze(-1).bool()
+        if is_first_mask.any():
+            initial_state = self.get_initial_states([])
+            attn_output[is_first_mask] = initial_state
         return attn_output
 
     def _representation(self, embedded_obs: Tensor) -> Tuple[Tensor, Tensor]:
@@ -444,17 +447,16 @@ class PlayerDV3(nn.Module):
         if self.seq_action.shape[0] == 0:
             attn_output = self.world_model.get_initial_states([1, num_envs])
         else:
-            attn_output = self.world_model._attn_output(stochastic_state[:-1], self.seq_action, self.seq_is_first[:-1])
-
-        is_first_mask = self.seq_is_first[1:].squeeze(-1).bool()
-        if is_first_mask.any():
-            initial_state = self.world_model.get_initial_states([])
-            attn_output[is_first_mask] = initial_state
+            fake_action = torch.zeros_like(self.seq_action[-1:])
+            seq_action_with_fake = torch.cat([self.seq_action, fake_action], dim=0)[-seq_len:]
+            attn_output = self.world_model._attn_output(stochastic_state[:-1], seq_action_with_fake[:-1], self.seq_is_first[:-1])
+            attn_output = torch.cat((attn_output, torch.zeros_like(attn_output[-1:])), dim=0)
+            attn_output = self.world_model._shift_and_mask(attn_output, self.seq_is_first)
 
         latent_state = self.world_model.latent(stochastic_state[-1:], attn_output[-1:])
 
         actions, _ = self.actor(latent_state[-1:], greedy, mask)
-        self.seq_action = torch.cat([self.seq_action, torch.cat(actions, dim=-1)], dim=0)[-(seq_len-1):]
+        self.seq_action = torch.cat([self.seq_action, torch.cat(actions, dim=-1)], dim=0)[-seq_len:]
         return actions
 
 
@@ -636,32 +638,6 @@ def train(
     # kl_loss seq dim is minus 1
     reconstruction_loss = (kl_regularizer * kl_loss + observation_loss + reward_loss + continue_loss).mean()
 
-    world_optimizer.zero_grad()
-    reconstruction_loss.backward()
-    world_model_grads = None
-    if cfg.algo.world_model.clip_gradients is not None and cfg.algo.world_model.clip_gradients > 0:
-        world_model_grads = torch.nn.utils.clip_grad_norm_(world_model.parameters(), cfg.algo.world_model.clip_gradients)
-    world_optimizer.step()
-
-    if aggregator and not aggregator.disabled:
-        aggregator.update("Loss/world_model_loss", reconstruction_loss.detach())
-        aggregator.update("Loss/observation_loss", observation_loss.mean().detach())
-        aggregator.update("Loss/reward_loss", reward_loss.mean().detach())
-        aggregator.update("Loss/continue_loss", continue_loss.mean().detach())
-        aggregator.update("Loss/state_loss", kl_loss.mean().detach())
-        aggregator.update("State/kl", kl.mean().detach())
-        if world_model_grads:
-            aggregator.update("Grads/world_model", world_model_grads.mean().detach())
-        aggregator.update(
-            "State/post_entropy",
-            Independent(OneHotCategorical(logits=posterior_logits.detach()), 1).entropy().mean().detach(),
-        )
-        aggregator.update(
-            "State/prior_entropy",
-            Independent(OneHotCategorical(logits=prior_logits.detach()), 1).entropy().mean().detach(),
-        )
-
-
     # Behaviour Learning
     latent_states_size = latent_states.shape[-1]
     new_batch_size = np.prod(latent_states.shape[:2])
@@ -783,6 +759,33 @@ def train(
 
     ac_loss = policy_loss + value_loss
 
+    # World model optimization
+    world_optimizer.zero_grad()
+    reconstruction_loss.backward()
+    world_model_grads = None
+    if cfg.algo.world_model.clip_gradients is not None and cfg.algo.world_model.clip_gradients > 0:
+        world_model_grads = torch.nn.utils.clip_grad_norm_(world_model.parameters(), cfg.algo.world_model.clip_gradients)
+    world_optimizer.step()
+
+    if aggregator and not aggregator.disabled:
+        aggregator.update("Loss/world_model_loss", reconstruction_loss.detach())
+        aggregator.update("Loss/observation_loss", observation_loss.mean().detach())
+        aggregator.update("Loss/reward_loss", reward_loss.mean().detach())
+        aggregator.update("Loss/continue_loss", continue_loss.mean().detach())
+        aggregator.update("Loss/state_loss", kl_loss.mean().detach())
+        aggregator.update("State/kl", kl.mean().detach())
+        if world_model_grads:
+            aggregator.update("Grads/world_model", world_model_grads.mean().detach())
+        aggregator.update(
+            "State/post_entropy",
+            Independent(OneHotCategorical(logits=posterior_logits.detach()), 1).entropy().mean().detach(),
+        )
+        aggregator.update(
+            "State/prior_entropy",
+            Independent(OneHotCategorical(logits=prior_logits.detach()), 1).entropy().mean().detach(),
+        )
+
+    # Actor-Critic optimization
     ac_optimizer.zero_grad()
     ac_loss.backward()
     actor_grads = None
