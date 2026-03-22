@@ -380,13 +380,23 @@ class WorldModel(nn.Module):
 
     def _shift_and_mask(self, stochastic_state: Tensor, actions: Tensor, is_first: Tensor = None) -> Tensor:
         initial_state = self.get_initial_states(stochastic_state.shape[:2])
-        stochastic_state = torch.cat((torch.zeros_like(stochastic_state[:1]), stochastic_state[:-1]), dim=0)
+        stochastic_state = torch.cat((initial_state[:1], stochastic_state[:-1]), dim=0)
         actions = torch.cat((torch.zeros_like(actions[:1]), actions[:-1]), dim=0)
         if is_first is not None:
             # 对于is_first为1的位置，重置为初始状态
             stochastic_state = (1 - is_first.unsqueeze(-1)) * stochastic_state + is_first.unsqueeze(-1) * initial_state
             actions = (1 - is_first) * actions
         return stochastic_state, actions
+
+    # def _shift_and_mask(self, stochastic_state: Tensor, actions: Tensor, is_first: Tensor = None) -> Tensor:
+    #     initial_state = self.get_initial_states(stochastic_state.shape[:2])
+    #     stochastic_state = torch.cat((torch.zeros_like(stochastic_state[:1]), stochastic_state[:-1]), dim=0)
+    #     actions = torch.cat((torch.zeros_like(actions[:1]), actions[:-1]), dim=0)
+    #     if is_first is not None:
+    #         # 对于is_first为1的位置，重置为初始状态
+    #         stochastic_state = (1 - is_first.unsqueeze(-1)) * stochastic_state + is_first.unsqueeze(-1) * initial_state
+    #         actions = (1 - is_first) * actions
+    #     return stochastic_state, actions
 
     # def _shift_and_mask(self, stochastic_state: Tensor, actions: Tensor, is_first: Tensor) -> Tensor:
     #     continue_state = self.get_initial_states([1, stochastic_state.shape[1]])
