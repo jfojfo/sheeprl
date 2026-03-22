@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirna
 
 import torch
 from torch import nn
-from agent_transformer7 import MyTransformerEncoderLayer, ReverseRoPEPosition
+from sheeprl.algos.dreamer_ppo.transformer_exp.agent_transformer7 import MyTransformerEncoderLayer, ReverseRoPEPosition
 from utils import generate_attention_mask
 
 

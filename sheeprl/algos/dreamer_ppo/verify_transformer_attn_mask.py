@@ -16,9 +16,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirna
 
 import torch
 from torch import nn
-from typing import Dict, Any
 
-from agent_transformer7 import MyTransformerEncoderLayer
+from sheeprl.algos.dreamer_ppo.transformer_exp.agent_transformer7 import MyTransformerEncoderLayer
 from utils import generate_attention_mask
 
 

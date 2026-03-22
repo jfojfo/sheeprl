@@ -13,24 +13,7 @@ from lightning import Fabric
 import gymnasium as gym
 from torchmetrics import SumMetric
 
-import sheeprl.algos.dreamer_ppo.agent_dreamerv3
-import sheeprl.algos.dreamer_ppo.agent
-import sheeprl.algos.dreamer_ppo.agent_transformer
-import sheeprl.algos.dreamer_ppo.agent_transformer2
-import sheeprl.algos.dreamer_ppo.agent_transformer3
-import sheeprl.algos.dreamer_ppo.agent_transformer4
-import sheeprl.algos.dreamer_ppo.agent_transformer5
-import sheeprl.algos.dreamer_ppo.agent_transformer6
-import sheeprl.algos.dreamer_ppo.agent_transformer7
-import sheeprl.algos.dreamer_ppo.agent_transformer7_1
-import sheeprl.algos.dreamer_ppo.agent_transformer7_2
-import sheeprl.algos.dreamer_ppo.agent_transformer7_3
-import sheeprl.algos.dreamer_ppo.agent_transformer7_4
-import sheeprl.algos.dreamer_ppo.agent_transformer7_5
-import sheeprl.algos.dreamer_ppo.agent_transformer7_6
-import sheeprl.algos.dreamer_ppo.agent_transformer8
-import sheeprl.algos.dreamer_ppo.agent_transformer9
-import sheeprl.algos.dreamer_ppo.agent_transformer10
+import sheeprl.algos.dreamer_ppo.transformer_exp.agent_transformer9 as agent_transformer
 from sheeprl.algos.dreamer_v3.utils import prepare_obs, Moments, test
 from sheeprl.data.buffers import EnvIndependentReplayBuffer, SequentialReplayBuffer
 from sheeprl.envs.wrappers import RestartOnException
@@ -42,8 +25,8 @@ from sheeprl.utils.timer import timer
 from sheeprl.utils.utils import save_configs, Ratio
 
 
-F_BUILD_AGENT = sheeprl.algos.dreamer_ppo.agent_transformer9.build_agent
-F_TRAIN = sheeprl.algos.dreamer_ppo.agent_transformer9.train
+F_BUILD_AGENT = agent_transformer.build_agent
+F_TRAIN = agent_transformer.train
 SAMPLE_NEXT_OBS = False
 
 @register_algorithm()
