@@ -638,6 +638,32 @@ def train(
     # kl_loss seq dim is minus 1
     reconstruction_loss = (kl_regularizer * kl_loss + observation_loss + reward_loss + continue_loss).mean()
 
+    # World model optimization
+    world_optimizer.zero_grad()
+    reconstruction_loss.backward()
+    world_model_grads = None
+    if cfg.algo.world_model.clip_gradients is not None and cfg.algo.world_model.clip_gradients > 0:
+        world_model_grads = torch.nn.utils.clip_grad_norm_(world_model.parameters(), cfg.algo.world_model.clip_gradients)
+    world_optimizer.step()
+
+    if aggregator and not aggregator.disabled:
+        aggregator.update("Loss/world_model_loss", reconstruction_loss.detach())
+        aggregator.update("Loss/observation_loss", observation_loss.mean().detach())
+        aggregator.update("Loss/reward_loss", reward_loss.mean().detach())
+        aggregator.update("Loss/continue_loss", continue_loss.mean().detach())
+        aggregator.update("Loss/state_loss", kl_loss.mean().detach())
+        aggregator.update("State/kl", kl.mean().detach())
+        if world_model_grads:
+            aggregator.update("Grads/world_model", world_model_grads.mean().detach())
+        aggregator.update(
+            "State/post_entropy",
+            Independent(OneHotCategorical(logits=posterior_logits.detach()), 1).entropy().mean().detach(),
+        )
+        aggregator.update(
+            "State/prior_entropy",
+            Independent(OneHotCategorical(logits=prior_logits.detach()), 1).entropy().mean().detach(),
+        )
+
     # Behaviour Learning
     latent_states_size = latent_states.shape[-1]
     new_batch_size = np.prod(latent_states.shape[:2])
@@ -758,32 +784,6 @@ def train(
     value_loss = torch.mean(value_loss * discount[:-1].squeeze(-1).detach())
 
     ac_loss = policy_loss + value_loss
-
-    # World model optimization
-    world_optimizer.zero_grad()
-    reconstruction_loss.backward()
-    world_model_grads = None
-    if cfg.algo.world_model.clip_gradients is not None and cfg.algo.world_model.clip_gradients > 0:
-        world_model_grads = torch.nn.utils.clip_grad_norm_(world_model.parameters(), cfg.algo.world_model.clip_gradients)
-    world_optimizer.step()
-
-    if aggregator and not aggregator.disabled:
-        aggregator.update("Loss/world_model_loss", reconstruction_loss.detach())
-        aggregator.update("Loss/observation_loss", observation_loss.mean().detach())
-        aggregator.update("Loss/reward_loss", reward_loss.mean().detach())
-        aggregator.update("Loss/continue_loss", continue_loss.mean().detach())
-        aggregator.update("Loss/state_loss", kl_loss.mean().detach())
-        aggregator.update("State/kl", kl.mean().detach())
-        if world_model_grads:
-            aggregator.update("Grads/world_model", world_model_grads.mean().detach())
-        aggregator.update(
-            "State/post_entropy",
-            Independent(OneHotCategorical(logits=posterior_logits.detach()), 1).entropy().mean().detach(),
-        )
-        aggregator.update(
-            "State/prior_entropy",
-            Independent(OneHotCategorical(logits=prior_logits.detach()), 1).entropy().mean().detach(),
-        )
 
     # Actor-Critic optimization
     ac_optimizer.zero_grad()
