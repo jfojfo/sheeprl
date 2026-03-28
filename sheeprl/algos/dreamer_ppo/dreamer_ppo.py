@@ -13,7 +13,7 @@ from lightning import Fabric
 import gymnasium as gym
 from torchmetrics import SumMetric
 
-import sheeprl.algos.dreamer_ppo.transformer_exp.agent_transformer20_1 as agent_transformer
+import sheeprl.algos.dreamer_ppo.transformer_exp.agent_transformer20_2 as agent
 from sheeprl.algos.dreamer_v3.utils import prepare_obs, Moments, test
 from sheeprl.data.buffers import EnvIndependentReplayBuffer, SequentialReplayBuffer
 from sheeprl.envs.wrappers import RestartOnException
@@ -25,8 +25,8 @@ from sheeprl.utils.timer import timer
 from sheeprl.utils.utils import save_configs, Ratio
 
 
-F_BUILD_AGENT = agent_transformer.build_agent
-F_TRAIN = agent_transformer.train
+F_BUILD_AGENT = agent.build_agent
+F_TRAIN = agent.train
 SAMPLE_NEXT_OBS = False
 
 @register_algorithm()
@@ -36,8 +36,8 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
 
     # These arguments cannot be changed
     cfg.env.frame_stack = -1
-    if 2 ** int(np.log2(cfg.env.screen_size)) != cfg.env.screen_size:
-        raise ValueError(f"The screen size must be a power of 2, got: {cfg.env.screen_size}")
+    # if 2 ** int(np.log2(cfg.env.screen_size)) != cfg.env.screen_size:
+    #     raise ValueError(f"The screen size must be a power of 2, got: {cfg.env.screen_size}")
 
     # Create Logger. This will create the logger only on the
     # rank-0 process

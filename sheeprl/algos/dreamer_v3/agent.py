@@ -198,7 +198,7 @@ class CNNDecoder(nn.Module):
         self.output_dim = (sum(output_channels), *image_size)
         self.model = nn.Sequential(
             nn.Linear(latent_state_size, cnn_encoder_output_dim),
-            nn.Unflatten(1, (-1, 4, 4)),
+            nn.Unflatten(1, (-1, image_size[0] // 2**stages, image_size[1] // 2**stages)),
             DeCNN(
                 input_channels=(2 ** (stages - 1)) * channels_multiplier,
                 hidden_channels=(
@@ -663,6 +663,7 @@ class PlayerDV3(nn.Module):
         obs: Dict[str, Tensor],
         greedy: bool = False,
         mask: Optional[Dict[str, Tensor]] = None,
+        is_first=None,
     ) -> Sequence[Tensor]:
         """
         Return the greedy actions.

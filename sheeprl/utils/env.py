@@ -198,7 +198,7 @@ def make_env(
         env = gym.wrappers.TransformObservation(env, transform_obs)
         for k in cnn_keys:
             env.observation_space[k] = gym.spaces.Box(
-                0, 255, (1 if cfg.env.grayscale else 3, cfg.env.screen_size, cfg.env.screen_size), np.uint8
+                0, 255, (1 if cfg.env.grayscale else env.observation_space[k].shape[-1], cfg.env.screen_size, cfg.env.screen_size), np.uint8
             )
 
         if cnn_keys is not None and len(cnn_keys) > 0 and cfg.env.frame_stack > 1:
