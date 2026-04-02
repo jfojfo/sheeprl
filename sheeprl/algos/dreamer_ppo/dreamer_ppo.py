@@ -13,7 +13,7 @@ from lightning import Fabric
 import gymnasium as gym
 from torchmetrics import SumMetric
 
-import sheeprl.algos.dreamer_ppo.transformer_exp.agent_transformer20_2 as agent
+import sheeprl.algos.dreamer_ppo.transformer_exp.agent_transformer20_3 as agent
 from sheeprl.algos.dreamer_v3.utils import prepare_obs, Moments, test
 from sheeprl.data.buffers import EnvIndependentReplayBuffer, SequentialReplayBuffer
 from sheeprl.envs.wrappers import RestartOnException
