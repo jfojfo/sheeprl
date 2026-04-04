@@ -220,6 +220,16 @@ class MyTransformerEncoderLayer(nn.Module):
 
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(embed_dim)
+        self.init_weight()
+
+    def init_weight(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                # 对于权重矩阵，使用 Xavier Uniform
+                nn.init.xavier_uniform_(p)
+            else:
+                # 对于偏置，初始化为 0
+                nn.init.zeros_(p)
 
     def forward(self, q_input, kv_input, kv_cache=None, attn_mask=None):
         """
