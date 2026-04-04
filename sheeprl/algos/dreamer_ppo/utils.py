@@ -85,6 +85,44 @@ def generate_attention_mask(is_first_seq: Tensor) -> Tuple[Tensor, Tensor]:
 
     return final_mask, key_padding_mask
 
+def generate_interleaved_attention_mask(is_first_seq: Tensor, interleaved_seq_len: int) -> Tuple[Tensor, Tensor]:
+    """
+    为交错 posterior-action 序列生成注意力掩码。
+
+    Args:
+        is_first_seq: 原始 is_first 标志 [B, T]
+        interleaved_seq_len: 交错序列长度 (2*T)
+
+    Returns:
+        final_mask: [B, 2T, 2T], True 表示 mask out
+        key_padding_mask: Episode 边界掩码
+    """
+    batch_size, original_seq_len = is_first_seq.shape
+    device = is_first_seq.device
+
+    # 扩展 is_first 到交错序列:
+    # posterior 位置（偶数索引）: 保持原始 is_first
+    # action 位置（奇数索引）: 设为 0
+    # is_first_interleaved: [is_first_0, 0, is_first_1, 0, ...]
+    is_first_expanded = is_first_seq.unsqueeze(-1).repeat(1, 1, 2)  # [B, T, 2]
+    is_first_expanded[:, :, 1] = 0  # action 位置设为 0
+    is_first_interleaved = is_first_expanded.reshape(batch_size, interleaved_seq_len)  # [B, 2T]
+
+    # Episode ID
+    episode_ids = torch.cumsum(is_first_interleaved, dim=-1)  # [B, 2T]
+
+    # Episode 边界掩码
+    episode_id_for_query = episode_ids.unsqueeze(-1)  # [B, 2T, 1]
+    episode_id_for_key = episode_ids.unsqueeze(-2)  # [B, 1, 2T]
+    key_padding_mask = episode_id_for_query > episode_id_for_key  # [B, 2T, 2T]
+
+    #因果掩码
+    causal_mask = torch.triu(torch.ones((interleaved_seq_len, interleaved_seq_len), dtype=torch.bool, device=device), diagonal=1)
+
+    final_mask = key_padding_mask | causal_mask
+    return final_mask, key_padding_mask
+
+
 def apply_lower_triangle_mask(mask: Tensor) -> Tensor:
     """
     Applies a lower triangular mask to the attention mask, setting all elements
