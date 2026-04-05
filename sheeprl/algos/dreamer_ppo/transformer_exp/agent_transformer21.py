@@ -192,8 +192,6 @@ class MySelfAttention(nn.Module):
         self.out_proj = nn.Linear(embed_dim, embed_dim)
         self.register_buffer("slopes", get_alibi_slopes(num_heads).view(num_heads, 1, 1))
 
-    import torch
-
     def _create_alibi_bias(self, tgt_len: int, seq_len: int, slopes: torch.Tensor) -> torch.Tensor:
         """
         创建支持非对称长度的 ALiBi 偏置矩阵。
@@ -539,32 +537,72 @@ class WorldModel(nn.Module):
         logits = logits.view(*logits.shape[:-2], -1)
         return logits
 
+    def _extract_posterior_output(self, attn_output_interleaved: Tensor) -> Tensor:
+        """
+        从交错序列中提取 posterior 位置的输出。
+
+        Args:
+            attn_output_interleaved: [2T, B, embed_dim]
+                                     索引 0,2,4,... 是 posterior 位置
+
+        Returns:
+            posterior_attn_output: [T, B, embed_dim]
+        """
+        seq_len = attn_output_interleaved.shape[0] // 2
+        posterior_indices = torch.arange(0, 2 * seq_len, 2, device=attn_output_interleaved.device)
+        return attn_output_interleaved[posterior_indices]
+
+    def _extract_action_output(self, attn_output_interleaved: Tensor) -> Tensor:
+        """
+        从交错序列中提取 action 位置的输出。
+
+        Args:
+            attn_output_interleaved: [2T, B, embed_dim]
+                                     索引 1,3,5,... 是 action 位置
+
+        Returns:
+            action_attn_output: [T, B, embed_dim]
+        """
+        seq_len = attn_output_interleaved.shape[0] // 2
+        action_indices = torch.arange(1, 2 * seq_len, 2, device=attn_output_interleaved.device)
+        return attn_output_interleaved[action_indices]
+
     def dynamic(self, embedded_obs: Tensor, actions: Tensor, is_first: Tensor) \
             -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
-        计算 posterior 和 prior，右移 prior_logits 使其与 posterior_logits 对齐。
+        计算 posterior 和 prior，使用交错序列处理并提取输出。
 
-        对齐策略：
-        - prior_logits attn右移 1 位计算得到，第一个位置用 initial_prior 填补
-        - posterior_logits 保持不变
-        - 这样 prior[t] 预测 posterior[t]：initial_prior -> p_0, prior_0 -> p_1, ...
+        处理流程：
+        1. 计算 posterior（通过 representation model）
+        2. 构建 interleaved 序列 [p_0, a_0, p_1, a_1, ...] 并通过 Transformer
+        3. 提取 posterior 位置输出 [p'_0, p'_1, ..., p'_{T-1}]
+        4. 提取 action 位置输出 [a'_0, a'_1, ..., a'_{T-1}]
+        5. 右移 action 输出 1 位：[init, a'_0, a'_1, ..., a'_{T-2}]
+        6. 通过 transition model 生成 prior
 
         Returns:
             posterior_logits: [T, B, stoch_state_size]
             posterior_stochastic_state: [T, B, stochastic_size, discrete_size]
-            prior_logits: [T, B, stoch_state_size] - attn右移后计算得到
+            prior_logits: [T, B, stoch_state_size]
             prior_stochastic_state: [T, B, stochastic_size, discrete_size]
-            attn_output_interleaved: [2T, B, embed_dim]
+            posterior_attn_output: [T, B, embed_dim] (已提取的 posterior 输出)
         """
         posterior_logits, posterior_stochastic_state = self._representation(embedded_obs)
         attn_output_interleaved = self._interleaved_attn_output(posterior_stochastic_state, actions, is_first)
 
-        batch_size = posterior_logits.shape[1]
-        initial_state = self.get_initial_states([2, batch_size])  # [B, embed_dim]
-        attn_output_interleaved_shifted = torch.cat([initial_state, attn_output_interleaved], dim=0)[:-2]
+        # 提取 posterior 和 action 位置的输出
+        posterior_attn_output = self._extract_posterior_output(attn_output_interleaved)
+        action_attn_output = self._extract_action_output(attn_output_interleaved)
 
-        prior_logits, prior_stochastic_state = self._transition_from_action_output(attn_output_interleaved_shifted)
-        return posterior_logits, posterior_stochastic_state, prior_logits, prior_stochastic_state, attn_output_interleaved
+        batch_size = posterior_logits.shape[1]
+        # initial_state 形状为 [1, B, embed_dim]
+        initial_state = self.get_initial_states([1, batch_size])
+
+        # 右移 action 输出 1 位：[init, a'_0, ..., a'_{T-2}] -> [T, B, embed_dim]
+        action_attn_output_shifted = torch.cat((initial_state, action_attn_output[:-1]), dim=0)
+
+        prior_logits, prior_stochastic_state = self._transition(action_attn_output_shifted)
+        return posterior_logits, posterior_stochastic_state, prior_logits, prior_stochastic_state, posterior_attn_output
 
     def latent(self, stochastic_state: Tensor, attn_output: Tensor) -> Tensor:
         """
@@ -572,23 +610,12 @@ class WorldModel(nn.Module):
 
         Args:
             stochastic_state: [T, B, stochastic_size, discrete_size]
-            attn_output: [2T, B, embed_dim] (交错序列输出)
+            attn_output: [T, B, embed_dim] (已提取的 posterior 输出)
 
         Returns:
             latent_state: [T, B, embed_dim]
         """
-        seq_len = stochastic_state.shape[0]
-
-        # 根据 attn_output 的形状判断是交错输出还是已提取的 posterior 输出
-        if attn_output.shape[0] == 2 * seq_len:
-            # 完整交错输出，提取 posterior 位置 (索引 0, 2, 4, ...)
-            posterior_indices = torch.arange(0, 2 * seq_len, 2, device=attn_output.device)
-            posterior_attn_output = attn_output[posterior_indices]  # [T, B, embed_dim]
-        else:
-            # 已经是 posterior 位置的输出
-            posterior_attn_output = attn_output  # [T, B, embed_dim]
-
-        return posterior_attn_output
+        return attn_output
 
     def _interleaved_attn_output(self, stochastic_state: Tensor, actions: Tensor, is_first: Tensor) -> Tensor:
         """
@@ -636,32 +663,19 @@ class WorldModel(nn.Module):
         return logits, compute_stochastic_state(logits, discrete=self.discrete_size)
 
     def _transition(self, attn_state: Tensor) -> Tuple[Tensor, Tensor]:
+        """
+        通过 transition model 计算下一个 stochastic state。
+
+        Args:
+            attn_state: [T, B, embed_dim] (可以是 action 位置的 transformer 输出)
+
+        Returns:
+            next_logits: [T, B, stoch_state_size]
+            next_stochastic_state: [T, B, stochastic_size, discrete_size]
+        """
         next_logits = self.transition_model(attn_state)
         next_logits = self._uniform_mix(next_logits)
         return next_logits, compute_stochastic_state(next_logits, discrete=self.discrete_size)
-
-    def _transition_from_action_output(self, attn_output_interleaved: Tensor) -> Tuple[Tensor, Tensor]:
-        """
-        从 action 位置的 Transformer 输出计算 prior。
-
-        Args:
-            attn_output_interleaved: [2T, B, embed_dim]
-
-        Returns:
-            prior_logits: [T, B, stoch_state_size]
-            prior_stochastic: [T, B, stochastic_size, discrete_size]
-        """
-        seq_len = attn_output_interleaved.shape[0] // 2
-
-        # 提取 action 位置的输出 (索引 1, 3, 5, ...)
-        action_indices = torch.arange(1, 2 * seq_len, 2, device=attn_output_interleaved.device)
-        action_attn_output = attn_output_interleaved[action_indices]  # [T, B, embed_dim]
-
-        # Transition model
-        prior_logits = self.transition_model(action_attn_output)
-        prior_logits = self._uniform_mix(prior_logits)
-
-        return prior_logits, compute_stochastic_state(prior_logits, discrete=self.discrete_size)
 
     def _create_imagination_mask(self, batch_size: int, cached_len: int, device: torch.device) -> Tensor:
         """
@@ -703,7 +717,7 @@ class WorldModel(nn.Module):
         Returns:
             logits: [1, B*T, stoch_state_size]
             stochastic_state: [1, B*T, stochastic_size, discrete_size]
-            posterior_output: [1, B*T, embed_dim] (用于构建 latent_state)
+            prior_attn_output: [1, B*T, embed_dim] (prior 位置的 transformer 输出)
             kv_cache: 更新后的 cache
         """
         batch_size = stochastic_state.shape[1]
@@ -726,14 +740,28 @@ class WorldModel(nn.Module):
             attn_mask=attn_mask
         )  # attn_output: [2, B*T, embed_dim]
 
-        posterior_output = attn_output[0:1]  # [1, B*T, embed_dim]
         action_output = attn_output[1:2]  # [1, B*T, embed_dim]
 
         logits = self.transition_model(action_output)
         logits = self._uniform_mix(logits)
         prior_stochastic = compute_stochastic_state(logits, discrete=self.discrete_size)
 
-        return logits, prior_stochastic, posterior_output, kv_cache
+        # 将新的 prior_stochastic 作为 query 通过 transformer，提取 prior attn output
+        prior_flat_new = prior_stochastic.view(1, batch_size, -1)  # [1, B*T, stoch_state_size]
+        embed_prior_new = self.embed_state(prior_flat_new)  # [1, B*T, embed_dim]
+        dummy_action = torch.zeros_like(action)
+        embed_action_new = self.embed_action(dummy_action)
+        interleaved_input_new = torch.cat([embed_prior_new, embed_action_new], dim=0)
+        cached_len_new = kv_cache[0].shape[0]
+        attn_mask_new = self._create_imagination_mask(batch_size, cached_len_new, interleaved_input_new.device)
+        attn_output_new, _, _ = self.transformer(
+            interleaved_input_new, interleaved_input_new,
+            kv_cache=kv_cache,
+            attn_mask=attn_mask_new
+        )
+        prior_attn_output = attn_output_new[0:1]  # [1, B*T, embed_dim]
+
+        return logits, prior_stochastic, prior_attn_output, kv_cache
 
 
 class PlayerDV3(nn.Module):
@@ -812,9 +840,11 @@ class PlayerDV3(nn.Module):
 
             # 提取最后一个 posterior 位置的输出
             # 最后一个 posterior 在交错序列中的索引是 2*(seq_len-1)
+            # 由于因果掩码，这个位置只能看到 [0, ..., 2*(seq_len-1)]，不包括 dummy action
             last_posterior_idx = 2 * (current_seq_len - 1)
             posterior_output = attn_output_interleaved[last_posterior_idx:last_posterior_idx+1]  # [1, B, embed_dim]
 
+        # posterior_output 已经是提取的 posterior 位置输出，不是交错格式
         latent_state = self.world_model.latent(stochastic_state[-1:], posterior_output)
 
         actions, _ = self.actor(latent_state[-1:], greedy, mask)
@@ -943,6 +973,7 @@ def train(
         embedded_obs, data["actions"], data["is_first"])
 
     # latent_states = torch.cat([posterior, attn_output], dim=-1)
+    # attn_output 已提取 posterior 输出，形状 [T, B, embed_dim]
     latent_states = world_model.latent(posterior_stochastic_state, attn_output)
     reconstructed_obs = world_model.observation_model(latent_states)
 
@@ -1065,9 +1096,10 @@ def train(
     )
     # Imagine trajectories in the latent space
     for i in range(1, cfg.algo.horizon + 1):
-        imagined_logits, imagined_stochastic_state, posterior_output, kv_cache = world_model.imagination(
+        imagined_logits, imagined_stochastic_state, imagined_attn_output, kv_cache = world_model.imagination(
             imagined_stochastic_state, actions, kv_cache)
-        imagined_latent_state = world_model.latent(imagined_stochastic_state, posterior_output)
+        # posterior_output 已经是提取的 posterior 位置输出 [1, B*T, embed_dim]，不是交错格式
+        imagined_latent_state = world_model.latent(imagined_stochastic_state, imagined_attn_output)
         imagined_trajectories[i] = imagined_latent_state
         actions = torch.cat(actor(imagined_latent_state.detach())[0], dim=-1)
         imagined_actions[i] = actions
