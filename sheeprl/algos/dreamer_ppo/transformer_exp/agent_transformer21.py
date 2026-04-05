@@ -24,6 +24,92 @@ from sheeprl.utils.distribution import MSEDistribution, TwoHotEncodingDistributi
 from sheeprl.utils.metric import MetricAggregator
 
 
+class ActionEmbedding(nn.Module):
+    """
+    动作嵌入模块，使用 nn.Embedding 将离散动作索引映射到 embedding 向量。
+
+    支持多个动作空间，每个动作空间有独立的 embedding 表。
+    输入可以是 one-hot 编码或动作索引。
+    """
+
+    def __init__(self, actions_dim: Sequence[int], embed_dim: int):
+        super().__init__()
+        self.actions_dim = actions_dim
+        self.embed_dim = embed_dim
+        self.num_actions = len(actions_dim)
+
+        # 为每个动作空间创建独立的 Embedding
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(dim, embed_dim) for dim in actions_dim
+        ])
+
+        # 如果有多个动作空间，使用可学习的权重聚合
+        if self.num_actions > 1:
+            self.action_weights = nn.Parameter(torch.ones(self.num_actions) / self.num_actions)
+
+    def forward(self, actions: Tensor) -> Tensor:
+        """
+        Args:
+            actions: 动作张量
+                - 如果是 one-hot 编码: [*, sum(actions_dim)]
+                - 如果是索引: [*, num_actions] (整数类型)
+
+        Returns:
+            embedding: [*, embed_dim]
+        """
+        # 判断输入是 one-hot 还是索引
+        if actions.dtype in (torch.float32, torch.float16, torch.float64):
+            # one-hot 编码，转换为索引
+            action_indices = self._onehot_to_indices(actions)
+        else:
+            # 已经是索引
+            action_indices = actions
+
+        # 分割每个动作空间的索引
+        if self.num_actions == 1:
+            # 单动作空间时，squeeze 最后一维
+            indices_list = [action_indices.squeeze(-1)]
+        else:
+            indices_list = torch.split(action_indices, 1, dim=-1)
+            indices_list = [idx.squeeze(-1) for idx in indices_list]
+
+        # 获取每个动作的 embedding
+        embeddings = []
+        for i, (embedding_layer, indices) in enumerate(zip(self.embeddings, indices_list)):
+            emb = embedding_layer(indices)  # [*, embed_dim]
+            embeddings.append(emb)
+
+        # 聚合多个动作空间的 embedding
+        if self.num_actions == 1:
+            return embeddings[0]
+        else:
+            # 使用学习到的权重加权求和
+            weights = F.softmax(self.action_weights, dim=0)
+            result = sum(w * emb for w, emb in zip(weights, embeddings))
+            return result
+
+    def _onehot_to_indices(self, onehot: Tensor) -> Tensor:
+        """
+        将 one-hot 编码转换为动作索引。
+
+        Args:
+            onehot: [*, sum(actions_dim)]
+
+        Returns:
+            indices: [*, num_actions]
+        """
+        indices_list = []
+        start = 0
+        for dim in self.actions_dim:
+            end = start + dim
+            onehot_slice = onehot[..., start:end]
+            indices = onehot_slice.argmax(dim=-1)
+            indices_list.append(indices)
+            start = end
+
+        return torch.stack(indices_list, dim=-1)
+
+
 class RightAlignRoPEPosition(nn.Module):
     def __init__(self, dim, max_seq_len=512):
         super().__init__()
@@ -345,7 +431,7 @@ class WorldModel(nn.Module):
             ],
         )
         embed_dim = world_model_cfg.transformer.embed_dim
-        embed_action = nn.Linear(int(sum(actions_dim)), embed_dim)
+        embed_action = ActionEmbedding(actions_dim, embed_dim)
         embed_state = nn.Linear(stoch_state_size, embed_dim)
         transformer = MyTransformerEncoderLayer(
             world_model_cfg.transformer.embed_dim,
@@ -455,9 +541,29 @@ class WorldModel(nn.Module):
 
     def dynamic(self, embedded_obs: Tensor, actions: Tensor, is_first: Tensor) \
             -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """
+        计算 posterior 和 prior，右移 prior_logits 使其与 posterior_logits 对齐。
+
+        对齐策略：
+        - prior_logits attn右移 1 位计算得到，第一个位置用 initial_prior 填补
+        - posterior_logits 保持不变
+        - 这样 prior[t] 预测 posterior[t]：initial_prior -> p_0, prior_0 -> p_1, ...
+
+        Returns:
+            posterior_logits: [T, B, stoch_state_size]
+            posterior_stochastic_state: [T, B, stochastic_size, discrete_size]
+            prior_logits: [T, B, stoch_state_size] - attn右移后计算得到
+            prior_stochastic_state: [T, B, stochastic_size, discrete_size]
+            attn_output_interleaved: [2T, B, embed_dim]
+        """
         posterior_logits, posterior_stochastic_state = self._representation(embedded_obs)
         attn_output_interleaved = self._interleaved_attn_output(posterior_stochastic_state, actions, is_first)
-        prior_logits, prior_stochastic_state = self._transition_from_action_output(attn_output_interleaved)
+
+        batch_size = posterior_logits.shape[1]
+        initial_state = self.get_initial_states([2, batch_size])  # [B, embed_dim]
+        attn_output_interleaved_shifted = torch.cat([initial_state, attn_output_interleaved], dim=0)[:-2]
+
+        prior_logits, prior_stochastic_state = self._transition_from_action_output(attn_output_interleaved_shifted)
         return posterior_logits, posterior_stochastic_state, prior_logits, prior_stochastic_state, attn_output_interleaved
 
     def latent(self, stochastic_state: Tensor, attn_output: Tensor) -> Tensor:
@@ -822,7 +928,7 @@ def train(
     device = fabric.device
     batch_obs = {k: data[k] / 255.0 - 0.5 for k in cfg.algo.cnn_keys.encoder}
     batch_obs.update({k: data[k] for k in cfg.algo.mlp_keys.encoder})
-    data["is_first"][0, :] = torch.ones_like(data["is_first"][0, :])
+    # data["is_first"][0, :] = torch.ones_like(data["is_first"][0, :])
 
     # Given how the environment interaction works, we remove the last actions
     # and add the first one as the zero action
