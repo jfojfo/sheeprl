@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from typing import *
+from typing import Tuple
 
 import gymnasium
 import hydra
@@ -537,7 +538,7 @@ class WorldModel(nn.Module):
         logits = logits.view(*logits.shape[:-2], -1)
         return logits
 
-    def _extract_posterior_output(self, attn_output_interleaved: Tensor) -> Tensor:
+    def _extract_state_output(self, attn_output_interleaved: Tensor) -> Tensor:
         """
         从交错序列中提取 posterior 位置的输出。
 
@@ -588,10 +589,10 @@ class WorldModel(nn.Module):
             posterior_attn_output: [T, B, embed_dim] (已提取的 posterior 输出)
         """
         posterior_logits, posterior_stochastic_state = self._representation(embedded_obs)
-        attn_output_interleaved = self._interleaved_attn_output(posterior_stochastic_state, actions, is_first)
+        attn_output_interleaved, _ = self._interleaved_attn_output(posterior_stochastic_state, actions, is_first)
 
         # 提取 posterior 和 action 位置的输出
-        posterior_attn_output = self._extract_posterior_output(attn_output_interleaved)
+        posterior_attn_output = self._extract_state_output(attn_output_interleaved)
         action_attn_output = self._extract_action_output(attn_output_interleaved)
 
         batch_size = posterior_logits.shape[1]
@@ -617,9 +618,19 @@ class WorldModel(nn.Module):
         """
         return attn_output
 
-    def _interleaved_attn_output(self, stochastic_state: Tensor, actions: Tensor, is_first: Tensor) -> Tensor:
+    def _attn_output(self, stochastic_state: Tensor, actions: Tensor, is_first: Tensor) -> tuple[
+        Tensor, tuple[Tensor, Tensor]]:
+        # 保留旧方法作为备用，但使用新的交错方法
+        return self._interleaved_attn_output(stochastic_state, actions, is_first)
+
+    def _interleaved_attn_output(
+        self,
+        stochastic_state: Tensor,  # [T, B, stochastic_size, discrete_size]
+        actions: Tensor,           # [T, B, action_dim]
+        is_first: Tensor           # [T, B, 1]
+    ) -> Tuple[Tensor, tuple[Tensor, Tensor]]:
         """
-        处理交错 posterior-action 序列。
+        处理交错 posterior-action 序列，返回 attn_output 和完整的 kv_cache。
 
         Args:
             stochastic_state: [T, B, stochastic_size, discrete_size]
@@ -628,15 +639,12 @@ class WorldModel(nn.Module):
 
         Returns:
             attn_output: [2T, B, embed_dim]
-                         索引 0,2,4,... 是 posterior 位置输出
-                         索引 1,3,5,... 是 action 位置输出
+            kv_cache: (k_cache, v_cache) 各形状 [2T, B, embed_dim]
         """
         seq_len, batch_size = stochastic_state.shape[:2]
 
-        # Flatten posterior
+        # 构建 interleaved 序列
         posterior_flat = stochastic_state.view(seq_len, batch_size, -1)  # [T, B, stoch_state_size]
-
-        # Embed 到 embed_dim
         embed_posterior = self.embed_state(posterior_flat)  # [T, B, embed_dim]
         embed_action = self.embed_action(actions)  # [T, B, embed_dim]
 
@@ -648,14 +656,37 @@ class WorldModel(nn.Module):
         is_first_transposed = is_first.squeeze(-1).transpose(0, 1)  # [B, T]
         attn_mask, _ = generate_interleaved_attention_mask(is_first_transposed, 2 * seq_len)  # [B, 2T, 2T]
 
-        # Transformer forward
-        attn_output, _, _ = self.transformer(interleaved_seq, interleaved_seq, attn_mask=attn_mask)
+        kv_cache = (
+            torch.empty(0, batch_size, interleaved_seq.shape[-1]).to(interleaved_seq.device),
+            torch.empty(0, batch_size, interleaved_seq.shape[-1]).to(interleaved_seq.device),
+        )
+        # Transformer forward，返回完整的 kv_cache
+        attn_output, _, kv_cache = self.transformer(
+            interleaved_seq, interleaved_seq, attn_mask=attn_mask, kv_cache=kv_cache,
+        )
 
-        return attn_output
+        return attn_output, kv_cache
 
-    def _attn_output(self, stochastic_state: Tensor, actions: Tensor, is_first: Tensor) -> Tensor:
-        # 保留旧方法作为备用，但使用新的交错方法
-        return self._interleaved_attn_output(stochastic_state, actions, is_first)
+    def _interleaved_attn_output_query_cache(self, prior_stochastic: Tensor, action: Tensor, is_first: Tensor, kv_cache: tuple[Tensor, Tensor]):
+        batch_size = prior_stochastic.shape[1]
+
+        # 将新的 prior_stochastic 作为 query 通过 transformer，提取 prior attn output
+        prior_flat = prior_stochastic.view(1, batch_size, -1)  # [1, B*T, stoch_state_size]
+        embed_prior = self.embed_state(prior_flat)  # [1, B*T, embed_dim]
+        embed_action = self.embed_action(action)
+        interleaved_input = torch.cat([embed_prior, embed_action], dim=0)
+        # cached_len_new = kv_cache[0].shape[0]
+        # attn_mask_new = self._create_imagination_mask(batch_size, cached_len_new, interleaved_input_new.device)
+        is_first_transposed = is_first.squeeze(-1).transpose(0, 1)  # [B, T]
+        attn_mask, _ = generate_interleaved_attention_mask(is_first_transposed, 2 * is_first.shape[0])  # [B, 2T, 2T]
+        attn_mask = attn_mask[:, -2:, :]
+
+        attn_output, _, kv_cache = self.transformer(
+            interleaved_input, interleaved_input,
+            kv_cache=kv_cache,
+            attn_mask=attn_mask
+        )
+        return attn_output, kv_cache
 
     def _representation(self, embedded_obs: Tensor) -> Tuple[Tensor, Tensor]:
         logits = self.representation_model(embedded_obs)
@@ -677,91 +708,39 @@ class WorldModel(nn.Module):
         next_logits = self._uniform_mix(next_logits)
         return next_logits, compute_stochastic_state(next_logits, discrete=self.discrete_size)
 
-    def _create_imagination_mask(self, batch_size: int, cached_len: int, device: torch.device) -> Tensor:
+    def imagination(self, stochastic_state: Tensor, action: Tensor, is_first: Tensor, kv_cache: tuple[Tensor, Tensor]) -> \
+    tuple[Tensor, Tensor, Tensor, tuple[Tensor, ...]]:
         """
-        为想象步骤创建注意力掩码。
+        单步想象，使用交错 batch [prior, action]，支持原始 batch 维度 B 或 flattened B*T。
 
         Args:
-            batch_size: 批大小
-            cached_len: KV cache 长度 (2*t)
-            device: 设备
+            stochastic_state: [1, batch, stochastic_size, discrete_size]
+                              batch 可以是原始 B 或 flattened B*T
+            action: [1, batch, action_dim]
+            kv_cache: (k_cache, v_cache), 各形状 [2*t, batch, embed_dim]
 
         Returns:
-            attn_mask: [B, 2, cached_len + 2]
-
-        因果结构：
-        - posterior_t 可见 cache + 自己，不可见 action_t（因为 action_t 基于 latent_state_t）
-        - action_t 可见全部（cache + posterior_t + 自己）
-        """
-        total_key_len = cached_len + 2
-        base_mask = torch.zeros(2, total_key_len, dtype=torch.bool, device=device)
-
-        # posterior query: 只 mask action_t（索引 cached_len + 1）
-        # posterior 可见 [0..cached_len] 即 cache + prior_t
-        base_mask[0, cached_len + 1] = True
-
-        # action query: 可见全部，不需要 mask
-        # base_mask[1, :] 已经全是 False
-
-        return base_mask.unsqueeze(0).expand(batch_size, -1, -1)
-
-    def imagination(self, stochastic_state: Tensor, action: Tensor, kv_cache: tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        """
-        单步想象，使用交错 batch [prior, action]。
-
-        Args:
-            stochastic_state: [1, B*T, stochastic_size, discrete_size]
-            action: [1, B*T, action_dim]
-            kv_cache: (k_cache, v_cache), 各形状 [2*t, B*T, embed_dim]
-
-        Returns:
-            logits: [1, B*T, stoch_state_size]
-            stochastic_state: [1, B*T, stochastic_size, discrete_size]
-            prior_attn_output: [1, B*T, embed_dim] (prior 位置的 transformer 输出)
+            logits: [1, batch, stoch_state_size]
+            stochastic_state: [1, batch, stochastic_size, discrete_size]
+            prior_attn_output: [1, batch, embed_dim] (prior 位置的 transformer 输出)
             kv_cache: 更新后的 cache
         """
-        batch_size = stochastic_state.shape[1]
+        limit = 2 * (self.cfg.algo.per_rank_sequence_length - 1)
+        is_first = is_first[-self.cfg.algo.per_rank_sequence_length:]
 
-        prior_flat = stochastic_state.view(1, batch_size, -1)  # [1, B*T, stoch_state_size]
+        kv_cache = tuple(t[-limit:] for t in kv_cache)
+        attn_output, kv_cache = self._interleaved_attn_output_query_cache(stochastic_state, action, is_first, kv_cache)
+        action_attn_output = self._extract_action_output(attn_output)
+        logits, prior_stochastic = self._transition(action_attn_output)
 
-        embed_prior = self.embed_state(prior_flat)  # [1, B*T, embed_dim]
-        embed_action = self.embed_action(action)  # [1, B*T, embed_dim]
-
-        # 交错 batch: [prior, action] -> [2, B*T, embed_dim]
-        interleaved_input = torch.cat([embed_prior, embed_action], dim=0)
-
-        # 注意力掩码: posterior 可见 cache, action 可见 cache+posterior
-        cached_len = kv_cache[0].shape[0]
-        attn_mask = self._create_imagination_mask(batch_size, cached_len, interleaved_input.device)
-
-        attn_output, _, kv_cache = self.transformer(
-            interleaved_input, interleaved_input,
-            kv_cache=kv_cache,
-            attn_mask=attn_mask
-        )  # attn_output: [2, B*T, embed_dim]
-
-        action_output = attn_output[1:2]  # [1, B*T, embed_dim]
-
-        logits = self.transition_model(action_output)
-        logits = self._uniform_mix(logits)
-        prior_stochastic = compute_stochastic_state(logits, discrete=self.discrete_size)
-
-        # 将新的 prior_stochastic 作为 query 通过 transformer，提取 prior attn output
-        prior_flat_new = prior_stochastic.view(1, batch_size, -1)  # [1, B*T, stoch_state_size]
-        embed_prior_new = self.embed_state(prior_flat_new)  # [1, B*T, embed_dim]
+        kv_cache = tuple(t[-limit:] for t in kv_cache)
         dummy_action = torch.zeros_like(action)
-        embed_action_new = self.embed_action(dummy_action)
-        interleaved_input_new = torch.cat([embed_prior_new, embed_action_new], dim=0)
-        cached_len_new = kv_cache[0].shape[0]
-        attn_mask_new = self._create_imagination_mask(batch_size, cached_len_new, interleaved_input_new.device)
-        attn_output_new, _, _ = self.transformer(
-            interleaved_input_new, interleaved_input_new,
-            kv_cache=kv_cache,
-            attn_mask=attn_mask_new
-        )
-        prior_attn_output = attn_output_new[0:1]  # [1, B*T, embed_dim]
+        is_first_new = torch.cat([is_first, torch.zeros_like(is_first[-1:])], dim=0)
+        is_first_new = is_first_new[-self.cfg.algo.per_rank_sequence_length:]
+        attn_output_new, _ = self._interleaved_attn_output_query_cache(prior_stochastic, dummy_action, is_first_new, kv_cache)
+        state_attn_output = self._extract_state_output(attn_output_new)
 
-        return logits, prior_stochastic, prior_attn_output, kv_cache
+        return logits, prior_stochastic, state_attn_output, kv_cache
 
 
 class PlayerDV3(nn.Module):
@@ -834,7 +813,7 @@ class PlayerDV3(nn.Module):
             padded_is_first = self.seq_is_first
 
             # 获取完整的交错序列 transformer 输出
-            attn_output_interleaved = self.world_model._interleaved_attn_output(
+            attn_output_interleaved, _ = self.world_model._interleaved_attn_output(
                 stochastic_state, padded_actions, padded_is_first
             )  # [2*seq_len, B, embed_dim]
 
@@ -1059,24 +1038,48 @@ def train(
 
     # Behaviour Learning
     latent_states_size = latent_states.shape[-1]
-    new_batch_size = np.prod(latent_states.shape[:2])
+    batch_size = latent_states.shape[1]  # 原始 B，不 reshape 成 B*T
+    original_seq_len = posterior_stochastic_state.shape[0]  # T
+
+    # 随机选择位置 pos ∈ [seq_len//2, seq_len-2]
+    pos = torch.randint(original_seq_len // 2, original_seq_len-1, (1,), device=device).item()
+
+    # === 预填充 kv_cache ===
+    # 从 posterior 子序列 [0:pos+1] 构建 interleaved 序列并通过 transformer
+    sub_posterior = posterior_stochastic_state[:pos]  # [pos, B, stochastic_size, discrete_size]
+    sub_actions = data["actions"][:pos]               # [pos, B, action_dim]
+    sub_is_first = data["is_first"][:pos]             # [pos, B, 1]
+
+    # 获取预填充的 kv_cache
+    with torch.no_grad():
+        sub_attn_output, kv_cache = world_model._interleaved_attn_output(
+            sub_posterior, sub_actions, sub_is_first
+        )
+        # kv_cache: ([2*pos, B, embed_dim], [2*pos, B, embed_dim])
+
+    # === 初始化想象轨迹 ===
     imagined_trajectories = torch.empty(
         cfg.algo.horizon + 1,
-        new_batch_size,
+        batch_size,
         latent_states_size,
         device=device,
     )
     imagined_actions = torch.empty(
         cfg.algo.horizon + 1,
-        new_batch_size,
+        batch_size,
         data["actions"].shape[-1],
         device=device,
     )
-    imagined_stochastic_state = posterior_stochastic_state.reshape(1, -1, *posterior_stochastic_state.shape[2:])
-    imagined_latent_state = latent_states.reshape(1, -1, latent_states_size)
-    actions = torch.cat(actor(imagined_latent_state.detach())[0], dim=-1)
-    imagined_trajectories[0] = imagined_latent_state
+
+    # 起始状态: 从 pos 位置开始
+    imagined_stochastic_state = posterior_stochastic_state[pos:pos+1]  # [1, B, stochastic_size, discrete_size]
+    start_latent = latent_states[pos:pos+1]  # [1, B, embed_dim]
+    with torch.no_grad():
+        actions = torch.cat(actor(start_latent.detach())[0], dim=-1)  # [1, B, action_dim]
+    imagined_trajectories[0] = start_latent
     imagined_actions[0] = actions
+
+    is_first_ext = torch.cat((sub_is_first, torch.zeros_like(sub_is_first[-1:])), dim=0)
 
     # The imagination goes like this, with H=3:
     # Actions:           a'0      a'1      a'2     a'4
@@ -1089,20 +1092,19 @@ def train(
     # Lambda-values:         l'1      l'2      l'3
     # Continues:     c0      c'1      c'2      c'3
     # where z0 comes from the posterior, while z'i is the imagined states (prior)
+    # 注意: z0 现在是从 pos 位置开始，kv_cache 已预填充了 [0..pos-1] 的历史
 
-    kv_cache = (
-        torch.empty(0, new_batch_size, cfg.algo.world_model.transformer.embed_dim).to(device),
-        torch.empty(0, new_batch_size, cfg.algo.world_model.transformer.embed_dim).to(device),
-    )
-    # Imagine trajectories in the latent space
-    for i in range(1, cfg.algo.horizon + 1):
-        imagined_logits, imagined_stochastic_state, imagined_attn_output, kv_cache = world_model.imagination(
-            imagined_stochastic_state, actions, kv_cache)
-        # posterior_output 已经是提取的 posterior 位置输出 [1, B*T, embed_dim]，不是交错格式
-        imagined_latent_state = world_model.latent(imagined_stochastic_state, imagined_attn_output)
-        imagined_trajectories[i] = imagined_latent_state
-        actions = torch.cat(actor(imagined_latent_state.detach())[0], dim=-1)
-        imagined_actions[i] = actions
+    with torch.no_grad():
+        # Imagine trajectories in the latent space
+        for i in range(1, cfg.algo.horizon + 1):
+            imagined_logits, imagined_stochastic_state, imagined_attn_output, kv_cache = world_model.imagination(
+                imagined_stochastic_state, actions, is_first_ext, kv_cache)
+            imagined_latent_state = world_model.latent(imagined_stochastic_state, imagined_attn_output)
+            imagined_trajectories[i] = imagined_latent_state
+            actions = torch.cat(actor(imagined_latent_state)[0], dim=-1)
+            imagined_actions[i] = actions
+            is_first_ext = torch.cat((is_first_ext, torch.zeros_like(is_first_ext[-1:])), dim=0)
+            is_first_ext = is_first_ext[-sequence_length:]
 
     imagined_trajectories = imagined_trajectories.detach()
     imagined_actions = imagined_actions.detach()
@@ -1116,7 +1118,8 @@ def train(
     predicted_rewards = dist_rewards_cls(world_model.reward_model(imagined_trajectories), dims=1).mean
 
     continues = Independent(BernoulliSafeMode(logits=world_model.continue_model(imagined_trajectories)), 1).mode
-    true_continue = (1 - data["terminated"]).flatten().reshape(1, -1, 1)
+    # true_continue: 从 pos 位置的 terminated 提取，形状 [1, B, 1]
+    true_continue = (1 - data["terminated"][pos:pos+1])  # [1, B, 1]
     continues = torch.cat((true_continue, continues[1:]))
 
     # Estimate lambda-values
