@@ -296,7 +296,7 @@ class MySelfAttention(nn.Module):
             alibi_bias = self._create_alibi_bias_interleaved(tgt_len, seq_len, self.slopes)
         else:
             alibi_bias = self._create_alibi_bias(tgt_len, seq_len, self.slopes)
-        alibi_bias = alibi_bias.repeat_interleave(repeats=batch_size, dim=0)
+        alibi_bias = alibi_bias.repeat(batch_size, 1, 1)
 
         attn_weights = attn_weights + alibi_bias
 
